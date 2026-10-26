@@ -1,13 +1,22 @@
-// Projection Mapping – tegner ett utsnitt av kilden inn i en firkantet flate
-// med perspektivkorrekt (homografi) avbildning.
+// Projection Mapping – tegner ett utsnitt av kilden inn i en flate
+// med perspektivkorrekt (homografi) avbildning. Flaten kan være
+// firkantet eller rund (ellipse innenfor de fire hjørnene).
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
 
-// Rader i 3x3-homografien som går fra utgangspiksel (x, y, 1) til kilde-UV.
-uniform float4 hrow0;
-uniform float4 hrow1;
-uniform float4 hrow2;
+// Utgangspiksel (x, y, 1) -> flatens egne koordinater (s, t) i 0..1
+uniform float4 drow0;
+uniform float4 drow1;
+uniform float4 drow2;
+
+// Flatens koordinater (s, t, 1) -> kilde-UV
+uniform float4 srow0;
+uniform float4 srow1;
+uniform float4 srow2;
+
+uniform float shape;   // 0 = firkant, 1 = rund
+uniform float feather; // myk kant i flatekoordinater
 
 sampler_state def_sampler {
 	Filter   = Linear;
@@ -35,11 +44,18 @@ VertOut VSMap(VertIn v_in)
 float4 PSMap(VertOut v_in) : TARGET
 {
 	float3 p = float3(v_in.opos, 1.0);
-	float u = dot(hrow0.xyz, p);
-	float v = dot(hrow1.xyz, p);
-	float w = dot(hrow2.xyz, p);
-	float2 uv = float2(u, v) / w;
-	return image.Sample(def_sampler, uv);
+	float2 st = float2(dot(drow0.xyz, p), dot(drow1.xyz, p)) / dot(drow2.xyz, p);
+
+	float3 q = float3(st, 1.0);
+	float2 uv = float2(dot(srow0.xyz, q), dot(srow1.xyz, q)) / dot(srow2.xyz, q);
+
+	float4 color = image.Sample(def_sampler, uv);
+
+	if (shape > 0.5) {
+		float d = length(st - float2(0.5, 0.5)) * 2.0;
+		color.a = color.a * saturate((1.0 - d) / feather);
+	}
+	return color;
 }
 
 technique Draw

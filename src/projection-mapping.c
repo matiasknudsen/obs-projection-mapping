@@ -42,15 +42,28 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #define PM_ID "projection_mapping_source"
 
+static void proc_add_surface(void *data, calldata_t *cd);
+static void proc_remove_surface(void *data, calldata_t *cd);
+static void proc_toggle_shape(void *data, calldata_t *cd);
+static void proc_reset_surface(void *data, calldata_t *cd);
+static void proc_set_mode(void *data, calldata_t *cd);
+static void proc_get_mode(void *data, calldata_t *cd);
+
 enum pm_mode {
 	MODE_SHOW = 0,     /* Ferdig: kun bildet, ingen hjelpelinjer */
 	MODE_GEOMETRY = 1, /* Dra hjørnene på flatene */
 	MODE_CROP = 2,     /* Velg utsnitt av innholdet for hver flate */
 };
 
+enum pm_shape {
+	SHAPE_QUAD = 0,
+	SHAPE_ROUND = 1,
+};
+
 struct pm_surface {
 	struct vec2 dst[4];
 	struct vec2 src[4];
+	int shape;
 };
 
 struct pm_source {
@@ -74,7 +87,7 @@ struct pm_source {
 
 	bool dragging;
 	int drag_surface;
-	int drag_corner; /* 0-3 = hjørne, -1 = hele flaten */
+	int drag_corner; /* 0-3 = hjørne, 4-7 = kant, -1 = hele flaten */
 	struct vec2 drag_last;
 };
 
@@ -157,17 +170,26 @@ static bool point_in_quad(const struct vec2 q[4], float x, float y)
 /* ------------------------------------------------------------------ */
 /* Lagring i OBS-prosjektet (kildens innstillinger)                    */
 
-static void surface_set_default(struct pm_surface *s, size_t index)
+/* aspect = utgangens bredde / høyde, slik at runde flater blir sirkler. */
+static void surface_set_default(struct pm_surface *s, size_t index, int shape, float aspect)
 {
 	float off = 0.05f * (float)(index % 6);
+	float h = 0.4f;
+	float w = shape == SHAPE_ROUND && aspect > 0.0f ? h / aspect : h;
 	vec2_set(&s->dst[0], 0.25f + off, 0.25f + off);
-	vec2_set(&s->dst[1], 0.65f + off, 0.25f + off);
-	vec2_set(&s->dst[2], 0.65f + off, 0.65f + off);
-	vec2_set(&s->dst[3], 0.25f + off, 0.65f + off);
+	vec2_set(&s->dst[1], 0.25f + off + w, 0.25f + off);
+	vec2_set(&s->dst[2], 0.25f + off + w, 0.25f + off + h);
+	vec2_set(&s->dst[3], 0.25f + off, 0.25f + off + h);
 	vec2_set(&s->src[0], 0.0f, 0.0f);
 	vec2_set(&s->src[1], 1.0f, 0.0f);
 	vec2_set(&s->src[2], 1.0f, 1.0f);
 	vec2_set(&s->src[3], 0.0f, 1.0f);
+	s->shape = shape;
+}
+
+static float pm_aspect(const struct pm_source *pm)
+{
+	return pm->height ? (float)pm->width / (float)pm->height : 1.0f;
 }
 
 static void load_surfaces(struct pm_source *pm, obs_data_t *settings)
@@ -190,6 +212,7 @@ static void load_surfaces(struct pm_source *pm, obs_data_t *settings)
 			snprintf(key, sizeof(key), "s%dy", c);
 			s.src[c].y = (float)obs_data_get_double(item, key);
 		}
+		s.shape = (int)obs_data_get_int(item, "shape");
 		da_push_back(pm->surfaces, &s);
 		obs_data_release(item);
 	}
@@ -214,6 +237,7 @@ static void save_surfaces(struct pm_source *pm, obs_data_t *settings)
 			snprintf(key, sizeof(key), "s%dy", c);
 			obs_data_set_double(item, key, s->src[c].y);
 		}
+		obs_data_set_int(item, "shape", s->shape);
 		obs_data_array_push_back(arr, item);
 		obs_data_release(item);
 	}
@@ -329,10 +353,18 @@ static void *pm_create(obs_data_t *settings, obs_source_t *source)
 	if (!pm->effect)
 		obs_log(LOG_ERROR, "Fant ikke / kunne ikke laste effects/mapping.effect");
 
+	proc_handler_t *ph = obs_source_get_proc_handler(source);
+	proc_handler_add(ph, "void pm_add_surface(in int shape)", proc_add_surface, pm);
+	proc_handler_add(ph, "void pm_remove_surface()", proc_remove_surface, pm);
+	proc_handler_add(ph, "void pm_toggle_shape()", proc_toggle_shape, pm);
+	proc_handler_add(ph, "void pm_reset_surface()", proc_reset_surface, pm);
+	proc_handler_add(ph, "void pm_set_mode(in int mode)", proc_set_mode, pm);
+	proc_handler_add(ph, "void pm_get_mode(out int mode)", proc_get_mode, pm);
+
 	/* Ny kilde: start med én flate så man ser noe med en gang. */
 	if (!obs_data_has_user_value(settings, "surfaces")) {
 		struct pm_surface s;
-		surface_set_default(&s, 0);
+		surface_set_default(&s, 0, SHAPE_QUAD, 1.0f);
 		da_push_back(pm->surfaces, &s);
 		save_surfaces(pm, settings);
 	}
@@ -484,27 +516,41 @@ static void draw_quad_strip(const struct vec2 p[4])
 	gs_render_stop(GS_TRISTRIP);
 }
 
+static void set_rows(gs_effect_t *effect, const char *prefix, const pm_mat3 m)
+{
+	char name[8];
+	for (int r = 0; r < 3; r++) {
+		struct vec4 v;
+		vec4_set(&v, (float)m[r * 3 + 0], (float)m[r * 3 + 1], (float)m[r * 3 + 2], 0.0f);
+		snprintf(name, sizeof(name), "%srow%d", prefix, r);
+		gs_effect_set_vec4(gs_effect_get_param_by_name(effect, name), &v);
+	}
+}
+
 static void draw_surface(struct pm_source *pm, gs_texture_t *tex, const struct pm_surface *s)
 {
 	struct vec2 px[4];
 	quad_to_pixels(pm, s->dst, px);
 
-	pm_mat3 to_dst, to_src, inv_dst, hmat;
+	pm_mat3 to_dst, to_src, inv_dst;
 	square_to_quad(px, to_dst);
 	square_to_quad(s->src, to_src);
 	if (!mat3_inverse(to_dst, inv_dst))
 		return;
-	mat3_mul(to_src, inv_dst, hmat);
 
-	struct vec4 r0, r1, r2;
-	vec4_set(&r0, (float)hmat[0], (float)hmat[1], (float)hmat[2], 0.0f);
-	vec4_set(&r1, (float)hmat[3], (float)hmat[4], (float)hmat[5], 0.0f);
-	vec4_set(&r2, (float)hmat[6], (float)hmat[7], (float)hmat[8], 0.0f);
+	/* Myk kant på runde flater: ca. 1,5 piksel uansett størrelse. */
+	float span = 1.0f;
+	for (int i = 0; i < 4; i++) {
+		float len = vec2_dist(&px[i], &px[(i + 1) % 4]);
+		if (len > span)
+			span = len;
+	}
 
 	gs_effect_set_texture_srgb(gs_effect_get_param_by_name(pm->effect, "image"), tex);
-	gs_effect_set_vec4(gs_effect_get_param_by_name(pm->effect, "hrow0"), &r0);
-	gs_effect_set_vec4(gs_effect_get_param_by_name(pm->effect, "hrow1"), &r1);
-	gs_effect_set_vec4(gs_effect_get_param_by_name(pm->effect, "hrow2"), &r2);
+	set_rows(pm->effect, "d", inv_dst);
+	set_rows(pm->effect, "s", to_src);
+	gs_effect_set_float(gs_effect_get_param_by_name(pm->effect, "shape"), (float)s->shape);
+	gs_effect_set_float(gs_effect_get_param_by_name(pm->effect, "feather"), 3.0f / span);
 
 	while (gs_effect_loop(pm->effect, "Draw"))
 		draw_quad_strip(px);
@@ -535,8 +581,26 @@ static void draw_box(struct vec2 c, float half)
 	gs_render_stop(GS_TRISTRIP);
 }
 
-static void draw_overlay_quad(struct pm_source *pm, gs_eparam_t *color, const struct vec2 q[4], bool selected,
-			      gs_technique_t *tech)
+/* Punkt (s, t) i flatens enhetskvadrat -> piksel. */
+static struct vec2 map_unit(const pm_mat3 m, float u, float v)
+{
+	double x = m[0] * u + m[1] * v + m[2];
+	double y = m[3] * u + m[4] * v + m[5];
+	double w = m[6] * u + m[7] * v + m[8];
+	struct vec2 r;
+	vec2_set(&r, (float)(x / w), (float)(y / w));
+	return r;
+}
+
+static void set_color(gs_eparam_t *color, uint32_t abgr)
+{
+	struct vec4 c;
+	vec4_from_rgba(&c, abgr);
+	gs_effect_set_vec4(color, &c);
+}
+
+static void draw_overlay_quad(struct pm_source *pm, gs_eparam_t *color, const struct vec2 q[4], int shape,
+			      bool selected, gs_technique_t *tech)
 {
 	struct vec2 px[4];
 	quad_to_pixels(pm, q, px);
@@ -545,19 +609,40 @@ static void draw_overlay_quad(struct pm_source *pm, gs_eparam_t *color, const st
 	if (t < 2.0f)
 		t = 2.0f;
 
-	struct vec4 line_col;
-	vec4_from_rgba(&line_col, selected ? 0xFF00D0FF : 0xFFFFD000); /* ABGR: gul / cyan */
-	gs_effect_set_vec4(color, &line_col);
+	pm_mat3 m;
+	square_to_quad(px, m);
+
+	/* Ramme rundt flaten (tynn hvis flaten er rund). */
+	set_color(color, selected ? 0xFF00D0FF : 0xFFFFD000); /* ABGR: gul / cyan */
 	gs_technique_begin_pass(tech, 0);
 	for (int i = 0; i < 4; i++)
-		draw_line(px[i], px[(i + 1) % 4], t);
+		draw_line(px[i], px[(i + 1) % 4], shape == SHAPE_ROUND ? fmaxf(1.0f, t * 0.4f) : t);
+	if (shape == SHAPE_ROUND) {
+		const int segs = 64;
+		struct vec2 prev = map_unit(m, 1.0f, 0.5f);
+		for (int i = 1; i <= segs; i++) {
+			float a = (float)i / (float)segs * 6.2831853f;
+			struct vec2 cur = map_unit(m, 0.5f + 0.5f * cosf(a), 0.5f + 0.5f * sinf(a));
+			draw_line(prev, cur, t);
+			prev = cur;
+		}
+	}
 	gs_technique_end_pass(tech);
 
+	/* Kanthåndtak (midt på hver kant). */
+	set_color(color, selected ? 0xFF00D0FF : 0xFFFFD000);
+	gs_technique_begin_pass(tech, 0);
 	for (int i = 0; i < 4; i++) {
-		struct vec4 c;
-		/* Øverste venstre hjørne markeres rødt, så man ser orienteringen. */
-		vec4_from_rgba(&c, i == 0 ? 0xFF3030FF : 0xFFFFFFFF);
-		gs_effect_set_vec4(color, &c);
+		struct vec2 mid;
+		vec2_add(&mid, &px[i], &px[(i + 1) % 4]);
+		vec2_mulf(&mid, &mid, 0.5f);
+		draw_box(mid, selected ? hs * 0.75f : hs * 0.5f);
+	}
+	gs_technique_end_pass(tech);
+
+	/* Hjørnehåndtak. Øverste venstre er rødt, så man ser orienteringen. */
+	for (int i = 0; i < 4; i++) {
+		set_color(color, i == 0 ? 0xFF3030FF : 0xFFFFFFFF);
 		gs_technique_begin_pass(tech, 0);
 		draw_box(px[i], selected ? hs : hs * 0.7f);
 		gs_technique_end_pass(tech);
@@ -575,11 +660,11 @@ static void draw_overlays(struct pm_source *pm)
 		if ((int)i == pm->selected)
 			continue;
 		const struct pm_surface *s = &pm->surfaces.array[i];
-		draw_overlay_quad(pm, color, pm->mode == MODE_CROP ? s->src : s->dst, false, tech);
+		draw_overlay_quad(pm, color, pm->mode == MODE_CROP ? s->src : s->dst, s->shape, false, tech);
 	}
 	if (pm->selected >= 0 && pm->selected < (int)pm->surfaces.num) {
 		const struct pm_surface *s = &pm->surfaces.array[pm->selected];
-		draw_overlay_quad(pm, color, pm->mode == MODE_CROP ? s->src : s->dst, true, tech);
+		draw_overlay_quad(pm, color, pm->mode == MODE_CROP ? s->src : s->dst, s->shape, true, tech);
 	}
 	gs_technique_end(tech);
 }
@@ -658,43 +743,43 @@ static bool hit_test(struct pm_source *pm, float px, float py, int *surface, int
 	float w = (float)pm->width, h = (float)pm->height;
 	int n = (int)pm->surfaces.num;
 
-	/* Rekkefølge: valgt flate først, deretter øverste (sist tegnet) først. */
-	for (int pass = 0; pass < 2; pass++) {
-		for (int k = n - 1; k >= 0; k--) {
-			int i = pass == 0 ? pm->selected : k;
-			if (i < 0 || i >= n)
-				continue;
-			struct vec2 *p = edit_points(pm, i);
-			for (int c = 0; c < 4; c++) {
-				float dx = p[c].x * w - px, dy = p[c].y * h - py;
-				if (dx * dx + dy * dy <= r * r) {
+	/* Tre runder: hjørner, kanter, innsiden. I hver runde sjekkes valgt
+	 * flate først, deretter øverste (sist tegnet) først. */
+	for (int kind = 0; kind < 3; kind++) {
+		for (int pass = 0; pass < 2; pass++) {
+			for (int k = n - 1; k >= 0; k--) {
+				int i = pass == 0 ? pm->selected : k;
+				if (i < 0 || i >= n)
+					continue;
+				struct vec2 q[4];
+				quad_to_pixels(pm, edit_points(pm, i), q);
+
+				if (kind == 0 || kind == 1) {
+					for (int c = 0; c < 4; c++) {
+						struct vec2 p = q[c];
+						if (kind == 1) {
+							vec2_add(&p, &q[c], &q[(c + 1) % 4]);
+							vec2_mulf(&p, &p, 0.5f);
+						}
+						float dx = p.x - px, dy = p.y - py;
+						if (dx * dx + dy * dy <= r * r) {
+							*surface = i;
+							*corner = kind == 0 ? c : 4 + c;
+							return true;
+						}
+					}
+				} else if (point_in_quad(q, px, py)) {
 					*surface = i;
-					*corner = c;
+					*corner = -1;
 					return true;
 				}
+				if (pass == 0)
+					break;
 			}
-			if (pass == 0)
-				break;
 		}
 	}
-
-	for (int pass = 0; pass < 2; pass++) {
-		for (int k = n - 1; k >= 0; k--) {
-			int i = pass == 0 ? pm->selected : k;
-			if (i < 0 || i >= n)
-				continue;
-			struct vec2 *p = edit_points(pm, i);
-			struct vec2 q[4];
-			quad_to_pixels(pm, p, q);
-			if (point_in_quad(q, px, py)) {
-				*surface = i;
-				*corner = -1;
-				return true;
-			}
-			if (pass == 0)
-				break;
-		}
-	}
+	UNUSED_PARAMETER(w);
+	UNUSED_PARAMETER(h);
 	return false;
 }
 
@@ -743,7 +828,11 @@ static void pm_mouse_move(void *data, const struct obs_mouse_event *event, bool 
 		pm->drag_last = cur;
 
 		struct vec2 *p = edit_points(pm, pm->drag_surface);
-		if (pm->drag_corner >= 0) {
+		if (pm->drag_corner >= 4) {
+			int a = pm->drag_corner - 4, b = (a + 1) % 4;
+			vec2_add(&p[a], &p[a], &delta);
+			vec2_add(&p[b], &p[b], &delta);
+		} else if (pm->drag_corner >= 0) {
 			vec2_add(&p[pm->drag_corner], &p[pm->drag_corner], &delta);
 		} else {
 			for (int c = 0; c < 4; c++)
@@ -771,26 +860,22 @@ static bool add_source_to_list(void *param, obs_source_t *src)
 	return true;
 }
 
-static bool add_surface_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+/* ------------------------------------------------------------------ */
+/* Handlinger (brukes av knappene og av mapping-panelet)                */
+
+static void action_add_surface(struct pm_source *pm, int shape)
 {
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	struct pm_source *pm = data;
 	pthread_mutex_lock(&pm->mutex);
 	struct pm_surface s;
-	surface_set_default(&s, pm->surfaces.num);
+	surface_set_default(&s, pm->surfaces.num, shape, pm_aspect(pm));
 	da_push_back(pm->surfaces, &s);
 	pm->selected = (int)pm->surfaces.num - 1;
 	save_to_source(pm);
 	pthread_mutex_unlock(&pm->mutex);
-	return false;
 }
 
-static bool remove_surface_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+static void action_remove_surface(struct pm_source *pm)
 {
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	struct pm_source *pm = data;
 	pthread_mutex_lock(&pm->mutex);
 	if (pm->selected >= 0 && pm->selected < (int)pm->surfaces.num) {
 		da_erase(pm->surfaces, pm->selected);
@@ -801,19 +886,26 @@ static bool remove_surface_clicked(obs_properties_t *props, obs_property_t *p, v
 		save_to_source(pm);
 	}
 	pthread_mutex_unlock(&pm->mutex);
-	return false;
 }
 
-static bool reset_surface_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+static void action_toggle_shape(struct pm_source *pm)
 {
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->mutex);
+	if (pm->selected >= 0 && pm->selected < (int)pm->surfaces.num) {
+		struct pm_surface *s = &pm->surfaces.array[pm->selected];
+		s->shape = s->shape == SHAPE_ROUND ? SHAPE_QUAD : SHAPE_ROUND;
+		save_to_source(pm);
+	}
+	pthread_mutex_unlock(&pm->mutex);
+}
+
+static void action_reset_surface(struct pm_source *pm)
+{
 	pthread_mutex_lock(&pm->mutex);
 	if (pm->selected >= 0 && pm->selected < (int)pm->surfaces.num) {
 		struct pm_surface *s = &pm->surfaces.array[pm->selected];
 		struct pm_surface def;
-		surface_set_default(&def, 0);
+		surface_set_default(&def, 0, s->shape, pm_aspect(pm));
 		if (pm->mode == MODE_CROP)
 			memcpy(s->src, def.src, sizeof(def.src));
 		else
@@ -821,6 +913,86 @@ static bool reset_surface_clicked(obs_properties_t *props, obs_property_t *p, vo
 		save_to_source(pm);
 	}
 	pthread_mutex_unlock(&pm->mutex);
+}
+
+static void action_set_mode(struct pm_source *pm, int mode)
+{
+	pthread_mutex_lock(&pm->mutex);
+	pm->mode = mode;
+	pm->dragging = false;
+	obs_data_t *settings = obs_source_get_settings(pm->self);
+	obs_data_set_int(settings, "mode", mode);
+	obs_data_release(settings);
+	pthread_mutex_unlock(&pm->mutex);
+}
+
+/* Proc-handlere: lar mapping-panelet styre kilden. */
+static void proc_add_surface(void *data, calldata_t *cd)
+{
+	action_add_surface(data, (int)calldata_int(cd, "shape"));
+}
+static void proc_remove_surface(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	action_remove_surface(data);
+}
+static void proc_toggle_shape(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	action_toggle_shape(data);
+}
+static void proc_reset_surface(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	action_reset_surface(data);
+}
+static void proc_set_mode(void *data, calldata_t *cd)
+{
+	action_set_mode(data, (int)calldata_int(cd, "mode"));
+}
+static void proc_get_mode(void *data, calldata_t *cd)
+{
+	struct pm_source *pm = data;
+	calldata_set_int(cd, "mode", pm->mode);
+}
+
+static bool add_surface_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	action_add_surface(data, SHAPE_QUAD);
+	return false;
+}
+
+static bool add_round_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	action_add_surface(data, SHAPE_ROUND);
+	return false;
+}
+
+static bool toggle_shape_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	action_toggle_shape(data);
+	return false;
+}
+
+static bool remove_surface_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	action_remove_surface(data);
+	return false;
+}
+
+static bool reset_surface_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	action_reset_surface(data);
 	return false;
 }
 
@@ -841,7 +1013,9 @@ static obs_properties_t *pm_get_properties(void *data)
 	obs_property_list_add_int(mode, "Velg utsnitt av innholdet", MODE_CROP);
 	obs_property_list_add_int(mode, "Ferdig (skjul hjelpelinjer)", MODE_SHOW);
 
-	obs_properties_add_button(props, "add_surface", "+ Legg til flate", add_surface_clicked);
+	obs_properties_add_button(props, "add_surface", "+ Legg til firkantet flate", add_surface_clicked);
+	obs_properties_add_button(props, "add_round", "+ Legg til rund flate", add_round_clicked);
+	obs_properties_add_button(props, "toggle_shape", "Gjør valgt flate rund / firkantet", toggle_shape_clicked);
 	obs_properties_add_button(props, "remove_surface", "Fjern valgt flate", remove_surface_clicked);
 	obs_properties_add_button(props, "reset_surface", "Nullstill valgt flate", reset_surface_clicked);
 
@@ -850,8 +1024,9 @@ static obs_properties_t *pm_get_properties(void *data)
 
 	obs_properties_add_text(
 		props, "help",
-		"Slik redigerer du: trykk OK, høyreklikk kilden og velg «Samhandle». "
-		"Dra hjørnene, eller dra midt i en flate for å flytte hele. Gul = valgt flate, rødt hjørne = øverst venstre.",
+		"Enklest: bruk panelet «Projection Mapping» i OBS-vinduet. Du kan også høyreklikke kilden og velge «Samhandle». "
+		"Dra hjørnene for perspektiv, kantene for å flytte en side, eller midt i flaten for å flytte hele. "
+		"Gul = valgt flate, rødt hjørne = øverst venstre.",
 		OBS_TEXT_INFO);
 
 	return props;

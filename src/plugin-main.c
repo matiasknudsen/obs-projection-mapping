@@ -23,10 +23,12 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 extern struct obs_source_info projection_mapping_source_info;
+extern void pm_dock_register(void);
 
 bool obs_module_load(void)
 {
 	obs_register_source(&projection_mapping_source_info);
+	pm_dock_register();
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
 }
