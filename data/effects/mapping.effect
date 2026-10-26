@@ -1,0 +1,52 @@
+// Projection Mapping – tegner ett utsnitt av kilden inn i en firkantet flate
+// med perspektivkorrekt (homografi) avbildning.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+// Rader i 3x3-homografien som går fra utgangspiksel (x, y, 1) til kilde-UV.
+uniform float4 hrow0;
+uniform float4 hrow1;
+uniform float4 hrow2;
+
+sampler_state def_sampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertIn {
+	float4 pos : POSITION;
+};
+
+struct VertOut {
+	float4 pos : POSITION;
+	float2 opos : TEXCOORD0;
+};
+
+VertOut VSMap(VertIn v_in)
+{
+	VertOut v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.opos = v_in.pos.xy;
+	return v_out;
+}
+
+float4 PSMap(VertOut v_in) : TARGET
+{
+	float3 p = float3(v_in.opos, 1.0);
+	float u = dot(hrow0.xyz, p);
+	float v = dot(hrow1.xyz, p);
+	float w = dot(hrow2.xyz, p);
+	float2 uv = float2(u, v) / w;
+	return image.Sample(def_sampler, uv);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSMap(v_in);
+		pixel_shader  = PSMap(v_in);
+	}
+}
