@@ -1,9 +1,10 @@
 // Projection Mapping – tegner ett utsnitt av kilden inn i en flate
 // med perspektivkorrekt (homografi) avbildning. Flaten kan være
-// firkantet eller rund (ellipse innenfor de fire hjørnene).
+// firkantet, avrundet eller rund, og kan ha en maske.
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
+uniform texture2d masktex;
 
 // Utgangspiksel (x, y, 1) -> flatens egne koordinater (s, t) i 0..1
 uniform float4 drow0;
@@ -15,8 +16,12 @@ uniform float4 srow0;
 uniform float4 srow1;
 uniform float4 srow2;
 
-uniform float shape;   // 0 = firkant, 1 = rund
-uniform float feather; // myk kant i flatekoordinater
+uniform float shape;    // 0 = firkant, 1 = rund
+uniform float feather;  // myk kant for runde flater (i flatekoordinater)
+uniform float radius;   // avrundede hjørner 0..1
+uniform float2 qsize;   // flatens omtrentlige størrelse i piksler
+uniform float2 out_size;
+uniform float use_mask;
 
 sampler_state def_sampler {
 	Filter   = Linear;
@@ -50,11 +55,24 @@ float4 PSMap(VertOut v_in) : TARGET
 	float2 uv = float2(dot(srow0.xyz, q), dot(srow1.xyz, q)) / dot(srow2.xyz, q);
 
 	float4 color = image.Sample(def_sampler, uv);
+	float a = 1.0;
 
 	if (shape > 0.5) {
 		float d = length(st - float2(0.5, 0.5)) * 2.0;
-		color.a = color.a * saturate((1.0 - d) / feather);
+		a = saturate((1.0 - d) / feather);
+	} else if (radius > 0.001) {
+		// Avrundet rektangel (signert avstand) i omtrentlige piksler.
+		float2 half_size = qsize * 0.5;
+		float r = radius * min(half_size.x, half_size.y);
+		float2 pp = abs((st - float2(0.5, 0.5)) * qsize) - (half_size - float2(r, r));
+		float dist = length(max(pp, float2(0.0, 0.0))) + min(max(pp.x, pp.y), 0.0) - r;
+		a = saturate(0.5 - dist);
 	}
+
+	if (use_mask > 0.5)
+		a = a * masktex.Sample(def_sampler, v_in.opos / out_size).r;
+
+	color.a = color.a * a;
 	return color;
 }
 
