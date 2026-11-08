@@ -77,6 +77,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 #include <utility>
 
 #define PM_ID "projection_mapping_source"
@@ -696,10 +697,25 @@ public:
 		flipBtn->setMenu(flipMenu);
 		guidesCheck = new QCheckBox("Vis hjelpelinjer på projektor", this);
 		guidesCheck->setToolTip("Av: linjene vises bare i OBS og i panelet, aldri på projektoren");
+		auto *fitBtn = new QPushButton("Original størrelse", this);
+		fitBtn->setToolTip("Gi valgt flate innholdets ekte pikselstørrelse (rett rektangel)");
 		row4->addWidget(snapBtn);
 		row4->addWidget(flipBtn);
-		row4->addWidget(guidesCheck, 1);
+		row4->addWidget(fitBtn);
 		root->addLayout(row4);
+
+		auto *row5 = new QHBoxLayout();
+		colorCheck = new QCheckBox("Fargekod kilder", this);
+		colorCheck->setToolTip("Gi mappingen og innholdet den viser samme farge i Kilder-listen");
+		row5->addWidget(guidesCheck);
+		row5->addWidget(colorCheck);
+		colorSwatch = new QLabel(this);
+		colorSwatch->setFixedSize(14, 14);
+		colorSwatch->setToolTip("Fargen denne mappingen og innholdet får i Kilder-listen");
+		row5->addWidget(colorSwatch);
+		row5->addStretch(1);
+		root->addLayout(row5);
+		connect(fitBtn, &QPushButton::clicked, this, [this]() { simple("pm_fit_content"); });
 
 		view = new MappingView(this);
 		root->addWidget(view, 1);
@@ -723,6 +739,15 @@ public:
 		connect(radiusSlider, &QSlider::valueChanged, this, [this](int v) { setRadius(v); });
 		connect(guidesCheck, &QCheckBox::toggled, this, [this](bool on) { setGuides(on); });
 		connect(snapBtn, &QPushButton::toggled, this, [this](bool on) { setSnap(on); });
+		connect(colorCheck, &QCheckBox::toggled, this, [this](bool on) {
+			obs_source_t *src = view->source();
+			if (src) {
+				obs_data_t *cfg = obs_source_get_settings(src);
+				obs_data_set_bool(cfg, "color_tags", on);
+				obs_data_release(cfg);
+			}
+			obs_source_release(src);
+		});
 		connect(flipMenu, &QMenu::aboutToShow, this, [this]() {
 			flipMenu->clear();
 			obs_source_t *src = view->source();
@@ -752,6 +777,8 @@ private:
 	QPushButton *redoBtn;
 	QCheckBox *guidesCheck;
 	QPushButton *snapBtn;
+	QCheckBox *colorCheck;
+	QLabel *colorSwatch;
 	QMenu *flipMenu;
 	MappingView *view;
 	QLabel *hint;
@@ -866,6 +893,13 @@ private:
 		{
 			QSignalBlocker block(guidesCheck);
 			guidesCheck->setChecked(obs_data_get_bool(settings, "guides_on_output"));
+		}
+		{
+			QSignalBlocker block(colorCheck);
+			colorCheck->setChecked(obs_data_get_bool(settings, "color_tags"));
+			const char *tag = obs_data_get_string(settings, "tag_color");
+			colorSwatch->setStyleSheet(*tag ? QString("background: %1; border-radius: 3px;").arg(tag)
+							: QString("background: none;"));
 		}
 		obs_data_release(settings);
 		obs_source_release(src);
@@ -1009,6 +1043,8 @@ public:
 			attach();
 			updateIndicator();
 			updateLocks();
+			if (++ticks % 3 == 0)
+				updateColors();
 		});
 		t->start(300);
 		qApp->installEventFilter(this);
@@ -1077,6 +1113,129 @@ private:
 	obs_weak_source_t *drawing = nullptr; /* kilden som tegner et hull nå */
 	matrix4 drawingInv;
 	std::set<std::pair<std::string, int64_t>> lockedByUs;
+	int ticks = 0;
+
+	/* ---- Fargekoding i Kilder-listen ---------------------------------- */
+
+	static void collectAllItems(obs_scene_t *scene, int depth, std::vector<obs_sceneitem_t *> &out)
+	{
+		if (!scene || depth > 8)
+			return;
+		struct Ctx {
+			int depth;
+			std::vector<obs_sceneitem_t *> *out;
+		} ctx = {depth, &out};
+		obs_scene_enum_items(
+			scene,
+			[](obs_scene_t *, obs_sceneitem_t *item, void *param) {
+				auto *c = static_cast<Ctx *>(param);
+				obs_sceneitem_addref(item);
+				c->out->push_back(item);
+				if (obs_sceneitem_is_group(item))
+					collectAllItems(obs_sceneitem_group_get_scene(item), c->depth + 1, *c->out);
+				return true;
+			},
+			&ctx);
+	}
+
+	void updateColors()
+	{
+		static const char *palette[] = {"#8c2b2b", "#2b4f8c", "#2f7a3a", "#8c5a1e",
+						"#5e2f8c", "#1f6f73", "#8c2b6a", "#6b6b1e"};
+
+		/* Hvilken farge skal hver kilde ha? */
+		auto list = allMappings();
+		std::set<std::string> used;
+		for (auto *s : list) {
+			obs_data_t *cfg = obs_source_get_settings(s);
+			const char *c = obs_data_get_string(cfg, "tag_color");
+			if (*c)
+				used.insert(c);
+			obs_data_release(cfg);
+		}
+		std::map<std::string, std::string> want; /* kilde-uuid -> farge */
+		for (auto *s : list) {
+			obs_data_t *cfg = obs_source_get_settings(s);
+			if (obs_data_get_bool(cfg, "color_tags")) {
+				std::string color = obs_data_get_string(cfg, "tag_color");
+				if (color.empty()) {
+					for (auto *p : palette)
+						if (!used.count(p)) {
+							color = p;
+							break;
+						}
+					if (color.empty())
+						color = palette[used.size() % 8];
+					obs_data_set_string(cfg, "tag_color", color.c_str());
+					used.insert(color);
+				}
+				want[obs_source_get_uuid(s)] = color;
+				const char *input = obs_data_get_string(cfg, "input");
+				if (*input && strcmp(input, "__program__") != 0)
+					want[input] = color;
+			}
+			obs_data_release(cfg);
+		}
+		releaseAll(list);
+
+		/* Gå gjennom alle scener og sett fargen på elementene (lagres i scenesamlingen). */
+		obs_frontend_source_list scenes = {};
+		obs_frontend_get_scenes(&scenes);
+		std::vector<obs_sceneitem_t *> items;
+		for (size_t i = 0; i < scenes.sources.num; i++)
+			collectAllItems(obs_scene_from_source(scenes.sources.array[i]), 0, items);
+		obs_frontend_source_list_free(&scenes);
+
+		bool changed = false;
+		std::map<std::string, std::string> nameColor;
+		std::set<std::string> nameClear;
+		for (auto *item : items) {
+			obs_source_t *src = obs_sceneitem_get_source(item);
+			obs_data_t *priv = obs_sceneitem_get_private_settings(item);
+			bool ours = obs_data_get_bool(priv, "pm_colored");
+			auto w = want.find(obs_source_get_uuid(src));
+			if (w != want.end()) {
+				if (!ours || obs_data_get_int(priv, "color-preset") != 1 ||
+				    w->second != obs_data_get_string(priv, "color")) {
+					obs_data_set_int(priv, "color-preset", 1);
+					obs_data_set_string(priv, "color", w->second.c_str());
+					obs_data_set_bool(priv, "pm_colored", true);
+					changed = true;
+				}
+				nameColor[obs_source_get_name(src)] = w->second;
+			} else if (ours) {
+				obs_data_set_int(priv, "color-preset", 0);
+				obs_data_set_string(priv, "color", "");
+				obs_data_set_bool(priv, "pm_colored", false);
+				nameClear.insert(obs_source_get_name(src));
+				changed = true;
+			}
+			obs_data_release(priv);
+			obs_sceneitem_release(item);
+		}
+		if (changed)
+			repaintSourceList(nameColor, nameClear);
+	}
+
+	/* OBS leser fargen når listen bygges; oppdater synlige rader med en gang. */
+	void repaintSourceList(const std::map<std::string, std::string> &nameColor,
+			       const std::set<std::string> &nameClear)
+	{
+		auto *tree = main->findChild<QWidget *>("sources");
+		if (!tree)
+			return;
+		for (auto *label : tree->findChildren<QLabel *>()) {
+			QWidget *row = label->parentWidget();
+			if (!row)
+				continue;
+			std::string name = label->text().toStdString();
+			auto c = nameColor.find(name);
+			if (c != nameColor.end())
+				row->setStyleSheet(QString("background: %1").arg(QString::fromStdString(c->second)));
+			else if (nameClear.count(name))
+				row->setStyleSheet("background: none");
+		}
+	}
 
 	void clearDrawing()
 	{

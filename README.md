@@ -10,13 +10,16 @@ Free and simple projection mapping directly inside OBS Studio (macOS first, Wind
 4. Right-click the source → **Open Source Projector** → choose your projector.
 5. Edit directly in the OBS preview (any zoom level) or in the **Projection Mapping** dock (Docks menu). Press **Tab** to switch mode:
    - **Move** (yellow): drag a **corner** for perspective, an **edge** handle to move one side, or **inside** a surface to move it.
-     **Shift + corner** scales proportionally with the opposite corner fixed. **Right-click** a surface to flip or rotate its content.
+     **Shift + corner** scales proportionally with the opposite corner fixed. Drag the **round handle** above the top edge to rotate
+     (Shift = 15° steps). **Right-click** a surface to flip or rotate its content. **Original size** gives the surface the content's real pixel size
+     (done automatically when you pick content for a new mapping).
    - **Mask** (red): double-click the red outline to add a point, double-click a point to remove it.
      Double-click **inside** a surface to cut a **hole**: click points, then click the first point (or press Enter). Esc cancels.
      Hold **Alt/⌥** and draw to add to the mask, **Alt/⌥ + Shift** and draw to erase.
    - **Done**: all guides hidden.
    - **Snap** (dock) makes corners and points stick to other surfaces and the frame edge.
    - **Cmd/Ctrl+Z** undoes, **Cmd/Ctrl+Shift+Z** redoes.
+   - **Color-code sources** gives each mapping and the content it shows the same color in the Sources list.
    - While editing, the Projection Mapping item is locked in OBS so the whole source can't be moved by accident.
 6. Switch to **Done** before the show. Untick **Show guides on projector** if the audience should never see them.
 

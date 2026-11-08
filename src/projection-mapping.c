@@ -121,6 +121,10 @@ struct pm_source {
 	obs_source_t *held;
 
 	bool snap;
+	gs_texture_t *white_tex; /* brukes når en flate ikke har maske */
+	bool created;            /* ferdig opprettet (skiller lasting fra brukervalg) */
+	bool fit_pending;        /* tilpass flater til innholdets størrelse når det dukker opp */
+	uint32_t input_w, input_h;
 
 	gs_texrender_t *texrender;
 	gs_effect_t *effect;
@@ -166,6 +170,7 @@ static void proc_flip(void *data, calldata_t *cd);
 static void proc_select_at(void *data, calldata_t *cd);
 static void proc_finish_hole(void *data, calldata_t *cd);
 static void proc_get_status(void *data, calldata_t *cd);
+static void proc_fit_content(void *data, calldata_t *cd);
 
 /* ------------------------------------------------------------------ */
 /* Matematikk                                                           */
@@ -727,6 +732,8 @@ static void pm_update(void *data, obs_data_t *settings)
 		pm->input_uuid = bstrdup(uuid);
 		pm->program_input = strcmp(uuid, PM_PROGRAM) == 0;
 		pm->need_resolve = true;
+		if (pm->created)
+			pm->fit_pending = true;
 	}
 	pthread_mutex_unlock(&pm->mutex);
 }
@@ -741,6 +748,11 @@ static void *pm_create(obs_data_t *settings, obs_source_t *source)
 	obs_enter_graphics();
 	pm->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	pm->tmp_tr = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	{
+		const uint32_t white = 0xFFFFFFFF;
+		const uint8_t *data = (const uint8_t *)&white;
+		pm->white_tex = gs_texture_create(1, 1, GS_RGBA, 1, &data, 0);
+	}
 	char *path = obs_module_file("effects/mapping.effect");
 	pm->effect = gs_effect_create_from_file(path, NULL);
 	bfree(path);
@@ -771,6 +783,7 @@ static void *pm_create(obs_data_t *settings, obs_source_t *source)
 			 proc_get_last_edit, pm);
 	proc_handler_add(ph, "void pm_set_guides(in bool enabled)", proc_set_guides, pm);
 	proc_handler_add(ph, "void pm_set_snap(in bool enabled)", proc_set_snap, pm);
+	proc_handler_add(ph, "void pm_fit_content()", proc_fit_content, pm);
 	proc_handler_add(ph, "void pm_flip(in int kind, in bool all)", proc_flip, pm);
 	proc_handler_add(ph, "void pm_select_at(in int x, in int y, out bool hit)", proc_select_at, pm);
 	proc_handler_add(ph, "void pm_finish_hole(in bool cancel, out bool handled)", proc_finish_hole, pm);
@@ -783,9 +796,11 @@ static void *pm_create(obs_data_t *settings, obs_source_t *source)
 		surface_set_default(&s, 0, SHAPE_QUAD, 1.0f);
 		da_push_back(pm->surfaces, &s);
 		save_surfaces_to(pm, settings);
+		pm->fit_pending = true;
 	}
 
 	pm_update(pm, settings);
+	pm->created = true;
 	return pm;
 }
 
@@ -798,6 +813,7 @@ static void pm_destroy(void *data)
 	obs_enter_graphics();
 	gs_texrender_destroy(pm->texrender);
 	gs_texrender_destroy(pm->tmp_tr);
+	gs_texture_destroy(pm->white_tex);
 	for (size_t i = 0; i < pm->mask_tr.num; i++)
 		gs_texrender_destroy(pm->mask_tr.array[i]);
 	gs_effect_destroy(pm->effect);
@@ -846,6 +862,66 @@ static void pm_get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "input", "");
 	obs_data_set_default_bool(settings, "guides_on_output", true);
 	obs_data_set_default_bool(settings, "snap", false);
+	obs_data_set_default_bool(settings, "color_tags", true);
+}
+
+/* Gjør en flate til et rett rektangel med innholdets ekte pikselstørrelse
+ * (krymper hvis innholdet er større enn projektorbildet). Kalles med mutex låst. */
+static void fit_surface(struct pm_source *pm, struct pm_surface *s, bool keep_center)
+{
+	if (!pm->input_w || !pm->input_h)
+		return;
+	float w = (float)pm->input_w / (float)pm->width;
+	float h = (float)pm->input_h / (float)pm->height;
+	float big = fmaxf(w, h);
+	if (big > 0.95f) {
+		w *= 0.95f / big;
+		h *= 0.95f / big;
+	}
+	float cx = 0.5f, cy = 0.5f;
+	if (keep_center) {
+		cx = 0.25f * (s->dst[0].x + s->dst[1].x + s->dst[2].x + s->dst[3].x);
+		cy = 0.25f * (s->dst[0].y + s->dst[1].y + s->dst[2].y + s->dst[3].y);
+	}
+	vec2_set(&s->dst[0], cx - w * 0.5f, cy - h * 0.5f);
+	vec2_set(&s->dst[1], cx + w * 0.5f, cy - h * 0.5f);
+	vec2_set(&s->dst[2], cx + w * 0.5f, cy + h * 0.5f);
+	vec2_set(&s->dst[3], cx - w * 0.5f, cy + h * 0.5f);
+	vec2_set(&s->src[0], 0.0f, 0.0f);
+	vec2_set(&s->src[1], 1.0f, 0.0f);
+	vec2_set(&s->src[2], 1.0f, 1.0f);
+	vec2_set(&s->src[3], 0.0f, 1.0f);
+}
+
+/* Står flaten fortsatt der den ble lagt til (ikke flyttet av brukeren)? */
+static bool surface_untouched(struct pm_source *pm, const struct pm_surface *s)
+{
+	for (size_t i = 0; i < 6; i++) {
+		struct pm_surface def;
+		surface_set_default(&def, i, s->shape, s->shape == SHAPE_ROUND ? pm_aspect(pm) : 1.0f);
+		bool same = true;
+		for (int c = 0; c < 4 && same; c++)
+			same = fabsf(def.dst[c].x - s->dst[c].x) < 1e-4f && fabsf(def.dst[c].y - s->dst[c].y) < 1e-4f;
+		if (same)
+			return true;
+	}
+	return false;
+}
+
+static void auto_fit(struct pm_source *pm)
+{
+	bool changed = false;
+	for (size_t i = 0; i < pm->surfaces.num; i++) {
+		struct pm_surface *s = &pm->surfaces.array[i];
+		if (s->shape == SHAPE_QUAD && surface_untouched(pm, s)) {
+			if (!changed)
+				push_undo(pm);
+			fit_surface(pm, s, false);
+			changed = true;
+		}
+	}
+	if (changed)
+		save_to_source(pm);
 }
 
 /* Sikkerhetsnett: start en video på nytt hvis den skal loope men har stoppet. */
@@ -909,6 +985,16 @@ static void pm_video_tick(void *data, float seconds)
 	}
 
 	if (cur) {
+		uint32_t iw = obs_source_get_width(cur), ih = obs_source_get_height(cur);
+		pthread_mutex_lock(&pm->mutex);
+		pm->input_w = iw;
+		pm->input_h = ih;
+		if (pm->fit_pending && iw && ih) {
+			pm->fit_pending = false;
+			auto_fit(pm);
+		}
+		pthread_mutex_unlock(&pm->mutex);
+
 		pm->media_timer += seconds;
 		if (pm->media_timer >= PM_RESTART_CHECK) {
 			pm->media_timer = 0.0f;
@@ -1133,7 +1219,9 @@ static void draw_surface(struct pm_source *pm, gs_texture_t *tex, size_t index)
 
 	bool masked = surface_has_mask(s) && index < pm->mask_tr.num;
 	gs_texture_t *mtex = masked ? gs_texrender_get_texture(pm->mask_tr.array[index]) : NULL;
-	gs_effect_set_texture(gs_effect_get_param_by_name(e, "masktex"), mtex ? mtex : tex);
+	/* Viktig: ikke bind innholdsteksturen to ganger (sRGB-innstillingen følger teksturen),
+	 * ellers blir bildet for lyst. Bruk en hvit 1x1-tekstur når det ikke er noen maske. */
+	gs_effect_set_texture(gs_effect_get_param_by_name(e, "masktex"), mtex ? mtex : pm->white_tex);
 	gs_effect_set_float(gs_effect_get_param_by_name(e, "use_mask"), mtex ? 1.0f : 0.0f);
 
 	while (gs_effect_loop(e, "Draw"))
@@ -1240,6 +1328,26 @@ static void draw_shape_outline(const struct pm_surface *s, const struct vec2 px[
 		draw_line(prev, first, t);
 }
 
+/* Rotasjonshåndtaket: en stilk ut fra midten av øverste kant, bort fra flatens sentrum. */
+static bool rotation_handle(const struct pm_source *pm, const struct vec2 px[4], struct vec2 *base, struct vec2 *pos)
+{
+	struct vec2 center;
+	vec2_set(&center, 0.25f * (px[0].x + px[1].x + px[2].x + px[3].x),
+		 0.25f * (px[0].y + px[1].y + px[2].y + px[3].y));
+	vec2_add(base, &px[0], &px[1]);
+	vec2_mulf(base, base, 0.5f);
+	struct vec2 dir;
+	vec2_sub(&dir, base, &center);
+	float len = vec2_len(&dir);
+	if (len < 1.0f)
+		return false;
+	vec2_mulf(&dir, &dir, 1.0f / len);
+	float stalk = handle_size(pm) * 5.0f;
+	vec2_mulf(&dir, &dir, stalk);
+	vec2_add(pos, base, &dir);
+	return true;
+}
+
 static void draw_move_overlay(struct pm_source *pm, gs_eparam_t *color, gs_technique_t *tech, size_t index,
 			      bool selected, bool crop)
 {
@@ -1265,9 +1373,30 @@ static void draw_move_overlay(struct pm_source *pm, gs_eparam_t *color, gs_techn
 	}
 	gs_technique_end_pass(tech);
 
+	/* Rotasjonshåndtak over øverste kant (bare valgt flate i Move). */
+	struct vec2 rot_base, rot_pos;
+	bool rot = selected && !crop && rotation_handle(pm, px, &rot_base, &rot_pos);
+	if (rot) {
+		gs_technique_begin_pass(tech, 0);
+		draw_line(rot_base, rot_pos, fmaxf(1.0f, t * 0.5f));
+		const int segs = 20;
+		struct vec2 prev;
+		vec2_set(&prev, rot_pos.x + hs * 1.1f, rot_pos.y);
+		for (int i = 1; i <= segs; i++) {
+			float a = (float)i / (float)segs * 6.2831853f;
+			struct vec2 cur;
+			vec2_set(&cur, rot_pos.x + hs * 1.1f * cosf(a), rot_pos.y + hs * 1.1f * sinf(a));
+			draw_line(prev, cur, fmaxf(1.5f, t * 0.6f));
+			prev = cur;
+		}
+		gs_technique_end_pass(tech);
+	}
+
 	/* Hjørnehåndtak. Øverste venstre er en rombe, så man ser orienteringen. */
 	set_color(color, 0xFFFFFFFF);
 	gs_technique_begin_pass(tech, 0);
+	if (rot)
+		draw_box(rot_pos, hs * 0.45f);
 	for (int i = 0; i < 4; i++) {
 		float half = selected ? hs : hs * 0.7f;
 		if (i == 0)
@@ -1480,6 +1609,20 @@ static bool hit_test_warp(struct pm_source *pm, float px, float py, int *surface
 {
 	float r = handle_size(pm) * 2.0f;
 	int n = (int)pm->surfaces.num;
+
+	/* Rotasjonshåndtaket på valgt flate (bare i Move) */
+	if (pm->mode == MODE_MOVE && pm->selected >= 0 && pm->selected < n) {
+		struct vec2 q[4], base, pos;
+		quad_to_pixels(pm, pm->surfaces.array[pm->selected].dst, q);
+		if (rotation_handle(pm, q, &base, &pos)) {
+			float dx = pos.x - px, dy = pos.y - py;
+			if (dx * dx + dy * dy <= r * r) {
+				*surface = pm->selected;
+				*corner = 8;
+				return true;
+			}
+		}
+	}
 
 	for (int kind = 0; kind < 3; kind++) {
 		for (int pass = 0; pass < 2; pass++) {
@@ -1938,6 +2081,29 @@ static void drag_warp(struct pm_source *pm, struct vec2 cur, uint32_t mods)
 	struct vec2 delta;
 	vec2_sub(&delta, &cur, &pm->drag_start);
 
+	/* Rotasjon rundt flatens sentrum. Shift = trinn på 15 grader. */
+	if (pm->drag_corner == 8) {
+		struct vec2 orig_px[4];
+		quad_to_pixels(pm, pm->drag_orig, orig_px);
+		struct vec2 c;
+		vec2_set(&c, 0.25f * (orig_px[0].x + orig_px[1].x + orig_px[2].x + orig_px[3].x),
+			 0.25f * (orig_px[0].y + orig_px[1].y + orig_px[2].y + orig_px[3].y));
+		struct vec2 a = to_px(pm, pm->drag_start), b = to_px(pm, cur);
+		float ang = atan2f(b.y - c.y, b.x - c.x) - atan2f(a.y - c.y, a.x - c.x);
+		if (mods & INTERACT_SHIFT_KEY) {
+			const float step = 0.2617994f; /* 15 grader */
+			ang = roundf(ang / step) * step;
+		}
+		float cs = cosf(ang), sn = sinf(ang);
+		for (int k = 0; k < 4; k++) {
+			float x = orig_px[k].x - c.x, y = orig_px[k].y - c.y;
+			struct vec2 r;
+			vec2_set(&r, c.x + x * cs - y * sn, c.y + x * sn + y * cs);
+			pts[k] = norm_point(pm, r);
+		}
+		return;
+	}
+
 	/* Shift + hjørne: skaler proporsjonalt, motsatt hjørne står fast. */
 	if ((mods & INTERACT_SHIFT_KEY) && pm->drag_corner >= 0 && pm->drag_corner < 4) {
 		struct vec2 orig_px[4];
@@ -2187,6 +2353,20 @@ static void proc_get_status(void *data, calldata_t *cd)
 	pthread_mutex_unlock(&pm->mutex);
 }
 
+static void proc_fit_content(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->mutex);
+	struct pm_surface *s = selected_surface(pm);
+	if (s && pm->input_w && pm->input_h) {
+		push_undo(pm);
+		fit_surface(pm, s, true);
+		save_to_source(pm);
+	}
+	pthread_mutex_unlock(&pm->mutex);
+}
+
 static void proc_set_snap(void *data, calldata_t *cd)
 {
 	struct pm_source *pm = data;
@@ -2352,6 +2532,7 @@ BUTTON_CB(clear_mask_clicked, action_clear_mask(data))
 BUTTON_CB(flip_h_clicked, action_flip(data, 0, false))
 BUTTON_CB(flip_v_clicked, action_flip(data, 1, false))
 BUTTON_CB(rotate_clicked, action_flip(data, 2, false))
+BUTTON_CB(fit_clicked, proc_fit_content(data, NULL))
 
 static obs_properties_t *pm_get_properties(void *data)
 {
@@ -2381,6 +2562,7 @@ static obs_properties_t *pm_get_properties(void *data)
 	obs_properties_add_button(props, "remove_surface", "Fjern valgt flate", remove_surface_clicked);
 	obs_properties_add_button(props, "reset_surface", "Nullstill valgt flate", reset_surface_clicked);
 	obs_properties_add_button(props, "clear_mask", "Fjern maske på valgt flate", clear_mask_clicked);
+	obs_properties_add_button(props, "fit", "Original størrelse (innholdets pikselstørrelse)", fit_clicked);
 	obs_properties_add_button(props, "flip_h", "Flip innhold horisontalt", flip_h_clicked);
 	obs_properties_add_button(props, "flip_v", "Flip innhold vertikalt", flip_v_clicked);
 	obs_properties_add_button(props, "rotate", "Roter innhold 180°", rotate_clicked);
