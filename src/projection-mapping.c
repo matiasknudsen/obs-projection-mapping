@@ -121,6 +121,7 @@ struct pm_source {
 	obs_source_t *held;
 
 	bool snap;
+	int color_mode;          /* 0 = nøyaktig kopi, 1 = lineær (sRGB), 2 = lysere (som 0.4) */
 	gs_texture_t *white_tex; /* brukes når en flate ikke har maske */
 	bool created;            /* ferdig opprettet (skiller lasting fra brukervalg) */
 	bool fit_pending;        /* tilpass flater til innholdets størrelse når det dukker opp */
@@ -720,6 +721,7 @@ static void pm_update(void *data, obs_data_t *settings)
 	pm->mode = (int)obs_data_get_int(settings, "mode");
 	pm->guides_on_output = obs_data_get_bool(settings, "guides_on_output");
 	pm->snap = obs_data_get_bool(settings, "snap");
+	pm->color_mode = (int)obs_data_get_int(settings, "color_mode");
 
 	if (pm->drag == DRAG_NONE)
 		load_surfaces_from(pm, settings);
@@ -863,6 +865,7 @@ static void pm_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "guides_on_output", true);
 	obs_data_set_default_bool(settings, "snap", false);
 	obs_data_set_default_bool(settings, "color_tags", true);
+	obs_data_set_default_int(settings, "color_mode", 0);
 }
 
 /* Gjør en flate til et rett rektangel med innholdets ekte pikselstørrelse
@@ -1042,7 +1045,11 @@ static void render_input_texture(struct pm_source *pm, obs_source_t *input)
 
 		gs_blend_state_push();
 		gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+		/* Nøyaktig kopi: be innholdet tegne uten sRGB-omregning, slik OBS gjør med
+		 * blandemetoden «SRGB av». Da blir pikslene identiske med originalen. */
+		const bool prev_linear = gs_set_linear_srgb(pm->color_mode == 1);
 		obs_source_video_render(input);
+		gs_set_linear_srgb(prev_linear);
 		gs_blend_state_pop();
 
 		gs_texrender_end(pm->texrender);
@@ -1205,7 +1212,10 @@ static void draw_surface(struct pm_source *pm, gs_texture_t *tex, size_t index)
 	float span = qw > qh ? qw : qh;
 
 	gs_effect_t *e = pm->effect;
-	gs_effect_set_texture_srgb(gs_effect_get_param_by_name(e, "image"), tex);
+	if (pm->color_mode == 1)
+		gs_effect_set_texture_srgb(gs_effect_get_param_by_name(e, "image"), tex);
+	else
+		gs_effect_set_texture(gs_effect_get_param_by_name(e, "image"), tex);
 	set_rows(e, "d", inv_dst);
 	set_rows(e, "s", to_src);
 	gs_effect_set_float(gs_effect_get_param_by_name(e, "shape"), (float)s->shape);
@@ -1562,12 +1572,15 @@ static void pm_video_render(void *data, gs_effect_t *unused)
 	gs_texture_t *tex = input ? gs_texrender_get_texture(pm->texrender) : NULL;
 
 	const bool prev_srgb = gs_framebuffer_srgb_enabled();
-	gs_enable_framebuffer_srgb(true);
+	gs_enable_framebuffer_srgb(pm->color_mode != 0);
 
 	if (pm->mode == MODE_CROP) {
 		if (tex) {
 			gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-			gs_effect_set_texture_srgb(gs_effect_get_param_by_name(def, "image"), tex);
+			if (pm->color_mode == 1)
+				gs_effect_set_texture_srgb(gs_effect_get_param_by_name(def, "image"), tex);
+			else
+				gs_effect_set_texture(gs_effect_get_param_by_name(def, "image"), tex);
 			while (gs_effect_loop(def, "Draw"))
 				gs_draw_sprite(tex, 0, pm->width, pm->height);
 		}
@@ -2553,6 +2566,11 @@ static obs_properties_t *pm_get_properties(void *data)
 	obs_property_list_add_int(mode, "Utsnitt (velg del av innholdet)", MODE_CROP);
 	obs_property_list_add_int(mode, "Ferdig (skjul hjelpelinjer)", MODE_SHOW);
 
+	obs_property_t *cm =
+		obs_properties_add_list(props, "color_mode", "Farger", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(cm, "Nøyaktig som originalen (anbefalt)", 0);
+	obs_property_list_add_int(cm, "Lineær (OBS-standard)", 1);
+	obs_property_list_add_int(cm, "Lysere", 2);
 	obs_properties_add_bool(props, "guides_on_output", "Vis hjelpelinjer på projektor");
 	obs_properties_add_bool(props, "snap", "Snap (fest til andre flater og bildekanten)");
 

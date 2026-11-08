@@ -715,6 +715,26 @@ public:
 		row5->addWidget(colorSwatch);
 		row5->addStretch(1);
 		root->addLayout(row5);
+
+		auto *row6 = new QHBoxLayout();
+		row6->addWidget(new QLabel("Farger", this));
+		colorMode = new QComboBox(this);
+		colorMode->addItem("Nøyaktig som originalen", 0);
+		colorMode->addItem("Lineær (OBS-standard)", 1);
+		colorMode->addItem("Lysere", 2);
+		colorMode->setToolTip("Hvis fargene ikke ser ut som originalfilen, prøv et annet valg");
+		row6->addWidget(colorMode, 1);
+		root->addLayout(row6);
+		connect(colorMode, &QComboBox::currentIndexChanged, this, [this](int) {
+			obs_source_t *src = view->source();
+			if (src) {
+				obs_data_t *cfg = obs_data_create();
+				obs_data_set_int(cfg, "color_mode", colorMode->currentData().toInt());
+				obs_source_update(src, cfg);
+				obs_data_release(cfg);
+			}
+			obs_source_release(src);
+		});
 		connect(fitBtn, &QPushButton::clicked, this, [this]() { simple("pm_fit_content"); });
 
 		view = new MappingView(this);
@@ -779,6 +799,7 @@ private:
 	QPushButton *snapBtn;
 	QCheckBox *colorCheck;
 	QLabel *colorSwatch;
+	QComboBox *colorMode;
 	QMenu *flipMenu;
 	MappingView *view;
 	QLabel *hint;
@@ -893,6 +914,12 @@ private:
 		{
 			QSignalBlocker block(guidesCheck);
 			guidesCheck->setChecked(obs_data_get_bool(settings, "guides_on_output"));
+		}
+		{
+			QSignalBlocker block(colorMode);
+			int idx = colorMode->findData((int)obs_data_get_int(settings, "color_mode"));
+			if (idx >= 0)
+				colorMode->setCurrentIndex(idx);
 		}
 		{
 			QSignalBlocker block(colorCheck);
