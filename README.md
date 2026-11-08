@@ -8,16 +8,21 @@ Free and simple projection mapping directly inside OBS Studio (macOS first, Wind
 2. Create a new scene, e.g. "Projector", and add the **Projection Mapping** source.
 3. In its properties: pick "Content" and set your projector's resolution. Click OK.
 4. Right-click the source → **Open Source Projector** → choose your projector.
-5. Edit directly in the OBS preview, or in the **Projection Mapping** dock (Docks menu). Press **Tab** to switch mode:
-   - **Move** (yellow): drag a **corner** for perspective, an **edge** handle to move one side, or **inside** a surface to move all of it.
+5. Edit directly in the OBS preview (any zoom level) or in the **Projection Mapping** dock (Docks menu). Press **Tab** to switch mode:
+   - **Move** (yellow): drag a **corner** for perspective, an **edge** handle to move one side, or **inside** a surface to move it.
+     **Shift + corner** scales proportionally with the opposite corner fixed. **Right-click** a surface to flip or rotate its content.
    - **Mask** (red): double-click the red outline to add a point, double-click a point to remove it.
+     Double-click **inside** a surface to cut a **hole**: click points, then click the first point (or press Enter). Esc cancels.
      Hold **Alt/⌥** and draw to add to the mask, **Alt/⌥ + Shift** and draw to erase.
    - **Done**: all guides hidden.
+   - **Snap** (dock) makes corners and points stick to other surfaces and the frame edge.
    - **Cmd/Ctrl+Z** undoes, **Cmd/Ctrl+Shift+Z** redoes.
-   - The dock also has **+ Square / + Round**, a **corner rounding** slider, **Clear mask** and **Crop** mode
-     (choose which part of the content each surface shows).
-   - Editing directly in the preview requires the preview scaling to be **Scale to window**.
+   - While editing, the Projection Mapping item is locked in OBS so the whole source can't be moved by accident.
 6. Switch to **Done** before the show. Untick **Show guides on projector** if the audience should never see them.
+
+**Content:** pick any source or scene, or **★ Active scene (program)** to follow whatever scene is live in OBS.
+The Projection Mapping source must not be inside the scene it shows – keep it in its own scene and show it with
+**Open Source Projector**.
 
 The mapping is saved in your OBS scene collection. Changing what plays in the "Content" scene keeps the mapping intact.
 

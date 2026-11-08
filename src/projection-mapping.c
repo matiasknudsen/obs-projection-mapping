@@ -65,7 +65,11 @@ enum pm_drag {
 	DRAG_WARP,       /* hjørne/kant/hele flaten (Move eller Utsnitt) */
 	DRAG_MASK_POINT, /* et punkt i maskepolygonet */
 	DRAG_LASSO,      /* frihåndstegning av maske */
+	DRAG_HOLE_POINT, /* et punkt i et hull */
 };
+
+#define PM_PROGRAM "__program__"
+#define PM_RESTART_CHECK 0.5f
 
 struct pm_stroke {
 	bool subtract;
@@ -79,6 +83,7 @@ struct pm_surface {
 	float radius;
 	DARRAY(struct vec2) mask;         /* tomt = ingen polygon-maske */
 	DARRAY(struct pm_stroke) strokes; /* frihåndsstrøk i rekkefølge */
+	DARRAY(struct pm_stroke) holes;   /* hull klikket ut midt i flaten */
 };
 
 /* Satt av panelet mens det tegner, så hjelpelinjer alltid vises der. */
@@ -101,9 +106,21 @@ struct pm_source {
 	uint32_t height;
 
 	char *input_uuid;
+	bool program_input; /* følg OBS sitt programbilde */
 	bool need_resolve;
 	float retry_timer;
+	float media_timer;
 	obs_weak_source_t *input;
+	bool input_error; /* innholdet inneholder mapping-kilden selv */
+	char *error_name;
+
+	/* Egen "grep" om innholdet så videoer spiller selv om de er skjult. */
+	pthread_mutex_t hold_mutex;
+	bool is_active;
+	bool is_showing;
+	obs_source_t *held;
+
+	bool snap;
 
 	gs_texrender_t *texrender;
 	gs_effect_t *effect;
@@ -113,10 +130,16 @@ struct pm_source {
 
 	int drag;
 	int drag_surface;
-	int drag_corner; /* 0-3 hjørne, 4-7 kant, -1 hele flaten; maskepunkt-indeks ved DRAG_MASK_POINT */
-	struct vec2 drag_last;
+	int drag_corner; /* 0-3 hjørne, 4-7 kant, -1 hele flaten; punkt-indeks ved maske/hull */
+	int drag_hole;
+	struct vec2 drag_start;   /* musens startpunkt (normalisert) */
+	struct vec2 drag_orig[4]; /* flatens punkter da dra startet */
 	bool lasso_subtract;
 	DARRAY(struct vec2) lasso;
+
+	bool drawing_hole;
+	DARRAY(struct vec2) hole_draft;
+	struct vec2 hover;
 
 	DARRAY(char *) undo;
 	DARRAY(char *) redo;
@@ -138,6 +161,11 @@ static void proc_clear_mask(void *data, calldata_t *cd);
 static void proc_wants_click(void *data, calldata_t *cd);
 static void proc_get_last_edit(void *data, calldata_t *cd);
 static void proc_set_guides(void *data, calldata_t *cd);
+static void proc_set_snap(void *data, calldata_t *cd);
+static void proc_flip(void *data, calldata_t *cd);
+static void proc_select_at(void *data, calldata_t *cd);
+static void proc_finish_hole(void *data, calldata_t *cd);
+static void proc_get_status(void *data, calldata_t *cd);
 
 /* ------------------------------------------------------------------ */
 /* Matematikk                                                           */
@@ -245,12 +273,19 @@ static void quad_size(const struct vec2 px[4], float *w, float *h)
 /* ------------------------------------------------------------------ */
 /* Flater: minne og standardverdier                                     */
 
+static void strokes_free(void *da_ptr)
+{
+	DARRAY(struct pm_stroke) *da = da_ptr;
+	for (size_t i = 0; i < da->num; i++)
+		da_free(da->array[i].pts);
+	da_free(*da);
+}
+
 static void surface_free(struct pm_surface *s)
 {
 	da_free(s->mask);
-	for (size_t i = 0; i < s->strokes.num; i++)
-		da_free(s->strokes.array[i].pts);
-	da_free(s->strokes);
+	strokes_free(&s->strokes);
+	strokes_free(&s->holes);
 }
 
 static void surfaces_clear(struct pm_source *pm)
@@ -262,7 +297,7 @@ static void surfaces_clear(struct pm_source *pm)
 
 static bool surface_has_mask(const struct pm_surface *s)
 {
-	return s->mask.num >= 3 || s->strokes.num > 0;
+	return s->mask.num >= 3 || s->strokes.num > 0 || s->holes.num > 0;
 }
 
 /* aspect = utgangens bredde / høyde, slik at runde flater blir sirkler. */
@@ -363,6 +398,22 @@ static void load_surfaces_from(struct pm_source *pm, obs_data_t *settings)
 		}
 		obs_data_array_release(strokes);
 
+		obs_data_array_t *holes = obs_data_get_array(item, "holes");
+		size_t nh = holes ? obs_data_array_count(holes) : 0;
+		for (size_t k = 0; k < nh; k++) {
+			obs_data_t *ho = obs_data_array_item(holes, k);
+			struct pm_stroke hole;
+			memset(&hole, 0, sizeof(hole));
+			hole.subtract = true;
+			string_to_points(obs_data_get_string(ho, "pts"), &hole.pts);
+			if (hole.pts.num >= 3)
+				da_push_back(s.holes, &hole);
+			else
+				da_free(hole.pts);
+			obs_data_release(ho);
+		}
+		obs_data_array_release(holes);
+
 		da_push_back(pm->surfaces, &s);
 		obs_data_release(item);
 	}
@@ -407,6 +458,18 @@ static void save_surfaces_to(struct pm_source *pm, obs_data_t *settings)
 		}
 		obs_data_set_array(item, "strokes", strokes);
 		obs_data_array_release(strokes);
+
+		obs_data_array_t *holes = obs_data_array_create();
+		for (size_t k = 0; k < s->holes.num; k++) {
+			obs_data_t *ho = obs_data_create();
+			points_to_string(&str, s->holes.array[k].pts.array, s->holes.array[k].pts.num);
+			obs_data_set_string(ho, "pts", str.array ? str.array : "");
+			dstr_free(&str);
+			obs_data_array_push_back(holes, ho);
+			obs_data_release(ho);
+		}
+		obs_data_set_array(item, "holes", holes);
+		obs_data_array_release(holes);
 
 		obs_data_array_push_back(arr, item);
 		obs_data_release(item);
@@ -497,6 +560,8 @@ static bool do_undo(struct pm_source *pm, bool redo)
 		restore(pm, state);
 		bfree(state);
 		pm->drag = DRAG_NONE;
+		pm->drawing_hole = false;
+		da_resize(pm->hole_draft, 0);
 		done = true;
 	}
 	pthread_mutex_unlock(&pm->mutex);
@@ -516,6 +581,34 @@ static obs_source_t *get_input(struct pm_source *pm)
 	return src;
 }
 
+/* Gi/ta tilbake vår egen aktiv/vises-referanse på innholdet. */
+static void hold_release(struct pm_source *pm)
+{
+	pthread_mutex_lock(&pm->hold_mutex);
+	if (pm->held) {
+		if (pm->is_active)
+			obs_source_dec_active(pm->held);
+		if (pm->is_showing)
+			obs_source_dec_showing(pm->held);
+		obs_source_release(pm->held);
+		pm->held = NULL;
+	}
+	pthread_mutex_unlock(&pm->hold_mutex);
+}
+
+static void hold_take(struct pm_source *pm, obs_source_t *src)
+{
+	pthread_mutex_lock(&pm->hold_mutex);
+	pm->held = obs_source_get_ref(src);
+	if (pm->held) {
+		if (pm->is_active)
+			obs_source_inc_active(pm->held);
+		if (pm->is_showing)
+			obs_source_inc_showing(pm->held);
+	}
+	pthread_mutex_unlock(&pm->hold_mutex);
+}
+
 static void set_input(struct pm_source *pm, obs_source_t *src)
 {
 	pthread_mutex_lock(&pm->mutex);
@@ -523,6 +616,7 @@ static void set_input(struct pm_source *pm, obs_source_t *src)
 	pm->input = NULL;
 	pthread_mutex_unlock(&pm->mutex);
 
+	hold_release(pm);
 	if (old_weak) {
 		obs_source_t *old = obs_weak_source_get_source(old_weak);
 		if (old) {
@@ -532,18 +626,70 @@ static void set_input(struct pm_source *pm, obs_source_t *src)
 		obs_weak_source_release(old_weak);
 	}
 
-	if (!src || src == pm->self)
-		return;
-
-	if (!obs_source_add_active_child(pm->self, src)) {
-		obs_log(LOG_WARNING, "Kan ikke bruke '%s' som innhold (den inneholder selve mapping-kilden).",
-			obs_source_get_name(src));
+	if (!src || src == pm->self) {
+		pthread_mutex_lock(&pm->mutex);
+		pm->input_error = src == pm->self;
+		pthread_mutex_unlock(&pm->mutex);
 		return;
 	}
 
+	if (!obs_source_add_active_child(pm->self, src)) {
+		pthread_mutex_lock(&pm->mutex);
+		if (!pm->input_error)
+			obs_log(LOG_WARNING, "Kan ikke bruke '%s' som innhold (den inneholder selve mapping-kilden).",
+				obs_source_get_name(src));
+		pm->input_error = true;
+		bfree(pm->error_name);
+		pm->error_name = bstrdup(obs_source_get_name(src));
+		pthread_mutex_unlock(&pm->mutex);
+		return;
+	}
+
+	hold_take(pm, src);
 	pthread_mutex_lock(&pm->mutex);
 	pm->input = obs_source_get_weak_source(src);
+	pm->input_error = false;
 	pthread_mutex_unlock(&pm->mutex);
+}
+
+static void pm_activate(void *data)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->hold_mutex);
+	pm->is_active = true;
+	if (pm->held)
+		obs_source_inc_active(pm->held);
+	pthread_mutex_unlock(&pm->hold_mutex);
+}
+
+static void pm_deactivate(void *data)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->hold_mutex);
+	pm->is_active = false;
+	if (pm->held)
+		obs_source_dec_active(pm->held);
+	pthread_mutex_unlock(&pm->hold_mutex);
+}
+
+static void pm_show(void *data)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->hold_mutex);
+	pm->is_showing = true;
+	if (pm->held)
+		obs_source_inc_showing(pm->held);
+	pthread_mutex_unlock(&pm->hold_mutex);
+}
+
+static void pm_hide(void *data)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->hold_mutex);
+	pm->is_showing = false;
+	if (pm->held)
+		obs_source_dec_showing(pm->held);
+	pthread_mutex_unlock(&pm->hold_mutex);
 }
 
 /* ------------------------------------------------------------------ */
@@ -568,6 +714,7 @@ static void pm_update(void *data, obs_data_t *settings)
 		pm->height = 16;
 	pm->mode = (int)obs_data_get_int(settings, "mode");
 	pm->guides_on_output = obs_data_get_bool(settings, "guides_on_output");
+	pm->snap = obs_data_get_bool(settings, "snap");
 
 	if (pm->drag == DRAG_NONE)
 		load_surfaces_from(pm, settings);
@@ -578,6 +725,7 @@ static void pm_update(void *data, obs_data_t *settings)
 	if (!pm->input_uuid || strcmp(pm->input_uuid, uuid) != 0) {
 		bfree(pm->input_uuid);
 		pm->input_uuid = bstrdup(uuid);
+		pm->program_input = strcmp(uuid, PM_PROGRAM) == 0;
 		pm->need_resolve = true;
 	}
 	pthread_mutex_unlock(&pm->mutex);
@@ -588,6 +736,7 @@ static void *pm_create(obs_data_t *settings, obs_source_t *source)
 	struct pm_source *pm = bzalloc(sizeof(struct pm_source));
 	pm->self = source;
 	pthread_mutex_init(&pm->mutex, NULL);
+	pthread_mutex_init(&pm->hold_mutex, NULL);
 
 	obs_enter_graphics();
 	pm->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
@@ -621,6 +770,12 @@ static void *pm_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void pm_get_last_edit(out int time, out int undo_count, out int redo_count)",
 			 proc_get_last_edit, pm);
 	proc_handler_add(ph, "void pm_set_guides(in bool enabled)", proc_set_guides, pm);
+	proc_handler_add(ph, "void pm_set_snap(in bool enabled)", proc_set_snap, pm);
+	proc_handler_add(ph, "void pm_flip(in int kind, in bool all)", proc_flip, pm);
+	proc_handler_add(ph, "void pm_select_at(in int x, in int y, out bool hit)", proc_select_at, pm);
+	proc_handler_add(ph, "void pm_finish_hole(in bool cancel, out bool handled)", proc_finish_hole, pm);
+	proc_handler_add(ph, "void pm_get_status(out string error, out bool drawing, out bool snap)", proc_get_status,
+			 pm);
 
 	/* Ny kilde: start med én flate så man ser noe med en gang. */
 	if (!obs_data_has_user_value(settings, "surfaces")) {
@@ -652,6 +807,9 @@ static void pm_destroy(void *data)
 	surfaces_clear(pm);
 	da_free(pm->surfaces);
 	da_free(pm->lasso);
+	da_free(pm->hole_draft);
+	bfree(pm->error_name);
+	pthread_mutex_destroy(&pm->hold_mutex);
 	clear_stack((pm_string_stack *)&pm->undo);
 	clear_stack((pm_string_stack *)&pm->redo);
 	da_free(pm->undo);
@@ -687,6 +845,21 @@ static void pm_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "selected", 0);
 	obs_data_set_default_string(settings, "input", "");
 	obs_data_set_default_bool(settings, "guides_on_output", true);
+	obs_data_set_default_bool(settings, "snap", false);
+}
+
+/* Sikkerhetsnett: start en video på nytt hvis den skal loope men har stoppet. */
+static void keep_media_looping(obs_source_t *input)
+{
+	if (!(obs_source_get_output_flags(input) & OBS_SOURCE_CONTROLLABLE_MEDIA))
+		return;
+	if (obs_source_media_get_state(input) != OBS_MEDIA_STATE_ENDED)
+		return;
+	obs_data_t *settings = obs_source_get_settings(input);
+	bool loop = obs_data_get_bool(settings, "looping") || obs_data_get_bool(settings, "loop");
+	obs_data_release(settings);
+	if (loop)
+		obs_source_media_restart(input);
 }
 
 static void pm_video_tick(void *data, float seconds)
@@ -696,6 +869,7 @@ static void pm_video_tick(void *data, float seconds)
 
 	pthread_mutex_lock(&pm->mutex);
 	bool need = pm->need_resolve;
+	bool program = pm->program_input;
 	char *uuid = bstrdup(pm->input_uuid ? pm->input_uuid : "");
 	bool have_weak = pm->input != NULL;
 	pm->need_resolve = false;
@@ -703,22 +877,43 @@ static void pm_video_tick(void *data, float seconds)
 
 	obs_source_t *cur = get_input(pm);
 
-	/* Innholdet finnes kanskje ikke ennå når prosjektet lastes: prøv igjen hvert sekund. */
-	if (!cur && *uuid) {
-		pm->retry_timer += seconds;
-		if (pm->retry_timer >= 1.0f) {
-			pm->retry_timer = 0.0f;
+	if (program) {
+		/* Kanal 0 = OBS sitt programbilde (inkludert overganger). */
+		obs_source_t *prog = obs_get_output_source(0);
+		if (prog != cur) {
+			pm->retry_timer += seconds;
+			if (need || cur || pm->retry_timer >= 1.0f) {
+				pm->retry_timer = 0.0f;
+				set_input(pm, prog);
+			}
+		}
+		obs_source_release(prog);
+	} else {
+		/* Innholdet finnes kanskje ikke ennå når prosjektet lastes: prøv igjen hvert sekund. */
+		if (!cur && *uuid) {
+			pm->retry_timer += seconds;
+			if (pm->retry_timer >= 1.0f) {
+				pm->retry_timer = 0.0f;
+				need = true;
+			}
+		}
+		if (!cur && have_weak)
 			need = true;
+
+		if (need) {
+			obs_source_t *src = *uuid ? obs_get_source_by_uuid(uuid) : NULL;
+			if (src != cur || !src)
+				set_input(pm, src);
+			obs_source_release(src);
 		}
 	}
-	if (!cur && have_weak)
-		need = true;
 
-	if (need) {
-		obs_source_t *src = *uuid ? obs_get_source_by_uuid(uuid) : NULL;
-		if (src != cur || !src)
-			set_input(pm, src);
-		obs_source_release(src);
+	if (cur) {
+		pm->media_timer += seconds;
+		if (pm->media_timer >= PM_RESTART_CHECK) {
+			pm->media_timer = 0.0f;
+			keep_media_looping(cur);
+		}
 	}
 
 	obs_source_release(cur);
@@ -818,6 +1013,42 @@ static void fill_polygon_xor(const struct vec2 *p, size_t n)
 }
 
 /* Tegner maske-teksturen for én flate (hvit = synlig). */
+/* Legg et polygon til (eller trekk det fra) en maske som allerede er tegnet. */
+static void composite_polygon(struct pm_source *pm, gs_texrender_t *tr, const struct vec2 *pts, size_t n, bool subtract)
+{
+	uint32_t w = pm->width, h = pm->height;
+	struct vec4 clear;
+
+	gs_texrender_reset(pm->tmp_tr);
+	if (!gs_texrender_begin(pm->tmp_tr, w, h))
+		return;
+	vec4_zero(&clear);
+	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+	gs_ortho(0.0f, 1.0f, 0.0f, 1.0f, -100.0f, 100.0f);
+	fill_polygon_xor(pts, n);
+	gs_texrender_end(pm->tmp_tr);
+
+	/* begin uten clear beholder masken som allerede ligger der. */
+	gs_texrender_reset(tr);
+	if (!gs_texrender_begin(tr, w, h))
+		return;
+	gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+	gs_blend_state_push();
+	gs_enable_blending(true);
+	if (subtract)
+		gs_blend_function(GS_BLEND_ZERO, GS_BLEND_INVSRCCOLOR);
+	else
+		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ONE);
+	gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_texture_t *tex = gs_texrender_get_texture(pm->tmp_tr);
+	gs_effect_set_texture(gs_effect_get_param_by_name(def, "image"), tex);
+	while (gs_effect_loop(def, "Draw"))
+		gs_draw_sprite(tex, 0, w, h);
+	gs_blend_state_pop();
+	gs_texrender_end(tr);
+}
+
+/* Tegner maske-teksturen for én flate (hvit = synlig). */
 static void render_mask(struct pm_source *pm, gs_texrender_t *tr, const struct pm_surface *s)
 {
 	uint32_t w = pm->width, h = pm->height;
@@ -838,37 +1069,13 @@ static void render_mask(struct pm_source *pm, gs_texrender_t *tr, const struct p
 		fill_polygon_xor(s->mask.array, s->mask.num);
 	gs_texrender_end(tr);
 
-	gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	for (size_t k = 0; k < s->strokes.num; k++) {
 		const struct pm_stroke *st = &s->strokes.array[k];
-
-		gs_texrender_reset(pm->tmp_tr);
-		if (!gs_texrender_begin(pm->tmp_tr, w, h))
-			continue;
-		vec4_zero(&clear);
-		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-		gs_ortho(0.0f, 1.0f, 0.0f, 1.0f, -100.0f, 100.0f);
-		fill_polygon_xor(st->pts.array, st->pts.num);
-		gs_texrender_end(pm->tmp_tr);
-
-		/* Legg strøket oppå masken (begin uten clear beholder innholdet). */
-		gs_texrender_reset(tr);
-		if (!gs_texrender_begin(tr, w, h))
-			continue;
-		gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
-		gs_blend_state_push();
-		gs_enable_blending(true);
-		if (st->subtract)
-			gs_blend_function(GS_BLEND_ZERO, GS_BLEND_INVSRCCOLOR);
-		else
-			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ONE);
-		gs_texture_t *tex = gs_texrender_get_texture(pm->tmp_tr);
-		gs_effect_set_texture(gs_effect_get_param_by_name(def, "image"), tex);
-		while (gs_effect_loop(def, "Draw"))
-			gs_draw_sprite(tex, 0, w, h);
-		gs_blend_state_pop();
-		gs_texrender_end(tr);
+		composite_polygon(pm, tr, st->pts.array, st->pts.num, st->subtract);
 	}
+	/* Hull trekkes alltid fra til slutt. */
+	for (size_t k = 0; k < s->holes.num; k++)
+		composite_polygon(pm, tr, s->holes.array[k].pts.array, s->holes.array[k].pts.num, true);
 }
 
 static void render_all_masks(struct pm_source *pm)
@@ -1131,6 +1338,40 @@ static void draw_mask_overlay(struct pm_source *pm, gs_eparam_t *color, gs_techn
 		gs_technique_end_pass(tech);
 	}
 
+	/* Hull: røde omriss med punkter. */
+	for (size_t k = 0; k < s->holes.num; k++) {
+		const struct pm_stroke *ho = &s->holes.array[k];
+		draw_points_px(pm, color, tech, ho->pts.array, ho->pts.num, true, t, red);
+		set_color(color, 0xFFFFFFFF);
+		gs_technique_begin_pass(tech, 0);
+		for (size_t i = 0; i < ho->pts.num; i++)
+			draw_box(to_px(pm, ho->pts.array[i]), hs * 0.7f);
+		gs_technique_end_pass(tech);
+		set_color(color, red);
+		gs_technique_begin_pass(tech, 0);
+		for (size_t i = 0; i < ho->pts.num; i++)
+			draw_box(to_px(pm, ho->pts.array[i]), hs * 0.4f);
+		gs_technique_end_pass(tech);
+	}
+
+	/* Hull som tegnes akkurat nå: linjer, strikk til musa og stort startpunkt. */
+	if (pm->drawing_hole && pm->hole_draft.num) {
+		draw_points_px(pm, color, tech, pm->hole_draft.array, pm->hole_draft.num, false, t, red);
+		struct vec2 last = to_px(pm, pm->hole_draft.array[pm->hole_draft.num - 1]);
+		struct vec2 first = to_px(pm, pm->hole_draft.array[0]);
+		set_color(color, 0xFFFFFFFF);
+		gs_technique_begin_pass(tech, 0);
+		draw_line(last, to_px(pm, pm->hover), fmaxf(1.0f, t * 0.5f));
+		draw_box(first, hs * 1.3f);
+		for (size_t i = 1; i < pm->hole_draft.num; i++)
+			draw_box(to_px(pm, pm->hole_draft.array[i]), hs * 0.6f);
+		gs_technique_end_pass(tech);
+		set_color(color, red);
+		gs_technique_begin_pass(tech, 0);
+		draw_box(first, hs * 0.8f);
+		gs_technique_end_pass(tech);
+	}
+
 	/* Strøket som tegnes akkurat nå. */
 	if (pm->drag == DRAG_LASSO)
 		draw_points_px(pm, color, tech, pm->lasso.array, pm->lasso.num, false, t,
@@ -1302,17 +1543,54 @@ static int hit_mask_edge(struct pm_source *pm, const struct pm_surface *s, struc
 	return -1;
 }
 
+static bool hit_hole_point(struct pm_source *pm, const struct pm_surface *s, struct vec2 p, int *hole, int *pt)
+{
+	float r = handle_size(pm) * 2.0f;
+	for (size_t k = 0; k < s->holes.num; k++) {
+		for (size_t i = 0; i < s->holes.array[k].pts.num; i++) {
+			struct vec2 q = to_px(pm, s->holes.array[k].pts.array[i]);
+			if (vec2_dist(&q, &p) <= r) {
+				*hole = (int)k;
+				*pt = (int)i;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool hit_hole_edge(struct pm_source *pm, const struct pm_surface *s, struct vec2 p, int *hole, int *edge)
+{
+	float r = handle_size(pm) * 1.5f;
+	for (size_t k = 0; k < s->holes.num; k++) {
+		const struct pm_stroke *ho = &s->holes.array[k];
+		for (size_t i = 0; i < ho->pts.num; i++) {
+			struct vec2 a = to_px(pm, ho->pts.array[i]);
+			struct vec2 b = to_px(pm, ho->pts.array[(i + 1) % ho->pts.num]);
+			if (dist_to_segment(p, a, b) <= r) {
+				*hole = (int)k;
+				*edge = (int)i;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 static int surface_under(struct pm_source *pm, struct vec2 p)
 {
 	int n = (int)pm->surfaces.num;
 	struct vec2 q[4];
+	bool crop = pm->mode == MODE_CROP;
 	if (pm->selected >= 0 && pm->selected < n) {
-		quad_to_pixels(pm, pm->surfaces.array[pm->selected].dst, q);
+		const struct pm_surface *s = &pm->surfaces.array[pm->selected];
+		quad_to_pixels(pm, crop ? s->src : s->dst, q);
 		if (point_in_poly(q, 4, p.x, p.y))
 			return pm->selected;
 	}
 	for (int i = n - 1; i >= 0; i--) {
-		quad_to_pixels(pm, pm->surfaces.array[i].dst, q);
+		const struct pm_surface *s = &pm->surfaces.array[i];
+		quad_to_pixels(pm, crop ? s->src : s->dst, q);
 		if (point_in_poly(q, 4, p.x, p.y))
 			return i;
 	}
@@ -1328,6 +1606,11 @@ static struct pm_surface *selected_surface(struct pm_source *pm)
 
 /* Vil et klikk her gjøre noe? Forhåndsvisningen bruker dette for å avgjøre
  * om klikket går til mappingen eller til OBS. Kalles med mutex låst. */
+static bool in_bounds(struct pm_source *pm, float x, float y)
+{
+	return x >= 0.0f && y >= 0.0f && x <= (float)pm->width && y <= (float)pm->height;
+}
+
 static bool wants_click(struct pm_source *pm, float x, float y, uint32_t mods)
 {
 	if (pm->mode == MODE_SHOW)
@@ -1335,11 +1618,14 @@ static bool wants_click(struct pm_source *pm, float x, float y, uint32_t mods)
 	struct vec2 p;
 	vec2_set(&p, x, y);
 	if (pm->mode == MODE_MASK) {
+		if (pm->drawing_hole)
+			return in_bounds(pm, x, y);
 		if (mods & INTERACT_ALT_KEY)
-			return selected_surface(pm) && x >= 0.0f && y >= 0.0f && x <= (float)pm->width &&
-			       y <= (float)pm->height;
+			return selected_surface(pm) && in_bounds(pm, x, y);
 		struct pm_surface *s = selected_surface(pm);
-		if (s && (hit_mask_point(pm, s, p) >= 0 || hit_mask_edge(pm, s, p) >= 0))
+		int a, b;
+		if (s && (hit_mask_point(pm, s, p) >= 0 || hit_mask_edge(pm, s, p) >= 0 ||
+			  hit_hole_point(pm, s, p, &a, &b) || hit_hole_edge(pm, s, p, &a, &b)))
 			return true;
 		return surface_under(pm, p) >= 0;
 	}
@@ -1354,33 +1640,112 @@ static struct vec2 norm_point(struct pm_source *pm, struct vec2 p)
 	return n;
 }
 
+static void finish_hole(struct pm_source *pm, bool cancel)
+{
+	struct pm_surface *s = selected_surface(pm);
+	if (!cancel && s && pm->hole_draft.num >= 3) {
+		push_undo(pm);
+		struct pm_stroke hole;
+		memset(&hole, 0, sizeof(hole));
+		hole.subtract = true;
+		da_copy(hole.pts, pm->hole_draft);
+		da_push_back(s->holes, &hole);
+		save_to_source(pm);
+	}
+	pm->drawing_hole = false;
+	da_resize(pm->hole_draft, 0);
+}
+
+static void start_drag(struct pm_source *pm, int kind, int surface, int corner, struct vec2 p)
+{
+	pm->drag = kind;
+	pm->drag_surface = surface;
+	pm->drag_corner = corner;
+	pm->drag_start = norm_point(pm, p);
+	if (kind == DRAG_WARP)
+		memcpy(pm->drag_orig, edit_points(pm, (size_t)surface), sizeof(pm->drag_orig));
+}
+
 static void mask_mouse_down(struct pm_source *pm, struct vec2 p, uint32_t mods, uint32_t clicks)
 {
 	struct pm_surface *s = selected_surface(pm);
+	struct vec2 n = norm_point(pm, p);
+	float r = handle_size(pm) * 2.0f;
+
+	/* Tegner et hull: hvert klikk er et nytt punkt. Klikk på startpunktet,
+	 * dobbeltklikk eller Enter lukker hullet. */
+	if (pm->drawing_hole) {
+		if (clicks >= 2) {
+			finish_hole(pm, false);
+			return;
+		}
+		if (pm->hole_draft.num >= 3) {
+			struct vec2 first = to_px(pm, pm->hole_draft.array[0]);
+			if (vec2_dist(&first, &p) <= r) {
+				finish_hole(pm, false);
+				return;
+			}
+		}
+		da_push_back(pm->hole_draft, &n);
+		pm->hover = n;
+		return;
+	}
 
 	/* Alt = tegn ny maske (legg til), Alt+Shift = visk ut. */
 	if ((mods & INTERACT_ALT_KEY) && s) {
 		pm->drag = DRAG_LASSO;
 		pm->lasso_subtract = (mods & INTERACT_SHIFT_KEY) != 0;
 		da_resize(pm->lasso, 0);
-		struct vec2 n = norm_point(pm, p);
 		da_push_back(pm->lasso, &n);
 		return;
 	}
 
+	if (s) {
+		int hole, pt;
+		/* Punkter i hull */
+		if (hit_hole_point(pm, s, p, &hole, &pt)) {
+			if (clicks >= 2) {
+				push_undo(pm);
+				struct pm_stroke *ho = &s->holes.array[hole];
+				if (ho->pts.num > 3) {
+					da_erase(ho->pts, (size_t)pt);
+				} else {
+					da_free(ho->pts);
+					da_erase(s->holes, (size_t)hole);
+				}
+				save_to_source(pm);
+				pm->drag = DRAG_NONE;
+				return;
+			}
+			push_undo(pm);
+			start_drag(pm, DRAG_HOLE_POINT, pm->selected, pt, p);
+			pm->drag_hole = hole;
+			return;
+		}
+		/* Dobbeltklikk på kanten av et hull = nytt punkt */
+		if (clicks >= 2 && hit_hole_edge(pm, s, p, &hole, &pt)) {
+			push_undo(pm);
+			da_insert(s->holes.array[hole].pts, (size_t)pt + 1, &n);
+			save_to_source(pm);
+			start_drag(pm, DRAG_HOLE_POINT, pm->selected, pt + 1, p);
+			pm->drag_hole = hole;
+			return;
+		}
+	}
+
 	if (s && clicks >= 2) {
-		/* Dobbeltklikk på punkt = fjern det. */
-		int pt = hit_mask_point(pm, s, p);
-		if (pt >= 0) {
+		/* Dobbeltklikk på punkt i ytterkanten = fjern det. */
+		int mp = hit_mask_point(pm, s, p);
+		if (mp >= 0) {
 			if (s->mask.num > 3) {
 				push_undo(pm);
-				da_erase(s->mask, (size_t)pt);
+				da_erase(s->mask, (size_t)mp);
 				save_to_source(pm);
 			}
 			pm->drag = DRAG_NONE;
 			return;
 		}
-		/* Dobbeltklikk på linjen = nytt punkt. */
+		/* Dobbeltklikk på den røde linjen = nytt punkt. */
 		int edge = hit_mask_edge(pm, s, p);
 		if (edge >= 0) {
 			push_undo(pm);
@@ -1389,25 +1754,29 @@ static void mask_mouse_down(struct pm_source *pm, struct vec2 p, uint32_t mods, 
 				for (int c = 0; c < 4; c++)
 					da_push_back(s->mask, &s->dst[c]);
 			}
-			struct vec2 n = norm_point(pm, p);
 			da_insert(s->mask, (size_t)edge + 1, &n);
 			save_to_source(pm);
-			pm->drag = DRAG_MASK_POINT;
-			pm->drag_surface = pm->selected;
-			pm->drag_corner = edge + 1;
-			pm->drag_last = n;
+			start_drag(pm, DRAG_MASK_POINT, pm->selected, edge + 1, p);
+			return;
+		}
+		/* Dobbeltklikk midt i flaten = start et hull. */
+		struct vec2 q[4];
+		quad_to_pixels(pm, s->dst, q);
+		if (point_in_poly(q, 4, p.x, p.y)) {
+			pm->drawing_hole = true;
+			da_resize(pm->hole_draft, 0);
+			da_push_back(pm->hole_draft, &n);
+			pm->hover = n;
+			pm->drag = DRAG_NONE;
 			return;
 		}
 	}
 
 	if (s) {
-		int pt = hit_mask_point(pm, s, p);
-		if (pt >= 0) {
+		int mp = hit_mask_point(pm, s, p);
+		if (mp >= 0) {
 			push_undo(pm);
-			pm->drag = DRAG_MASK_POINT;
-			pm->drag_surface = pm->selected;
-			pm->drag_corner = pt;
-			pm->drag_last = norm_point(pm, p);
+			start_drag(pm, DRAG_MASK_POINT, pm->selected, mp, p);
 			return;
 		}
 	}
@@ -1443,10 +1812,7 @@ static void pm_mouse_click(void *data, const struct obs_mouse_event *event, int3
 			if (hit_test_warp(pm, p.x, p.y, &s, &c)) {
 				push_undo(pm);
 				pm->selected = s;
-				pm->drag = DRAG_WARP;
-				pm->drag_surface = s;
-				pm->drag_corner = c;
-				pm->drag_last = norm_point(pm, p);
+				start_drag(pm, DRAG_WARP, s, c, p);
 			}
 		}
 	} else if (pm->drag == DRAG_LASSO) {
@@ -1469,6 +1835,169 @@ static void pm_mouse_click(void *data, const struct obs_mouse_event *event, int3
 	pthread_mutex_unlock(&pm->mutex);
 }
 
+/* ---- Snapping ---------------------------------------------------- */
+
+struct snap_best {
+	float dist;
+	struct vec2 corr; /* korreksjon i piksler */
+};
+
+static void snap_consider(struct snap_best *b, struct vec2 from, struct vec2 to)
+{
+	float d = vec2_dist(&from, &to);
+	if (d < b->dist) {
+		b->dist = d;
+		vec2_sub(&b->corr, &to, &from);
+	}
+}
+
+/* Finn minste korreksjon som får ett av punktene (piksler) til å treffe
+ * et hjørne/kant på en annen flate eller kanten av bildet. */
+static struct vec2 snap_correction(struct pm_source *pm, const struct vec2 *pts, size_t n, int skip_surface)
+{
+	float w = (float)pm->width, h = (float)pm->height;
+	float limit = fmaxf(8.0f, handle_size(pm) * 1.5f);
+	struct snap_best best = {limit, {0.0f, 0.0f}};
+	struct snap_best axis_x = {limit, {0.0f, 0.0f}}, axis_y = {limit, {0.0f, 0.0f}};
+	bool crop = pm->mode == MODE_CROP;
+
+	for (size_t i = 0; i < n; i++) {
+		struct vec2 p = pts[i];
+
+		/* Bildets hjørner og kanter */
+		const float cx[2] = {0.0f, w}, cy[2] = {0.0f, h};
+		for (int a = 0; a < 2; a++) {
+			for (int b = 0; b < 2; b++) {
+				struct vec2 c;
+				vec2_set(&c, cx[a], cy[b]);
+				snap_consider(&best, p, c);
+			}
+			if (fabsf(p.x - cx[a]) < axis_x.dist) {
+				axis_x.dist = fabsf(p.x - cx[a]);
+				vec2_set(&axis_x.corr, cx[a] - p.x, 0.0f);
+			}
+			if (fabsf(p.y - cy[a]) < axis_y.dist) {
+				axis_y.dist = fabsf(p.y - cy[a]);
+				vec2_set(&axis_y.corr, 0.0f, cy[a] - p.y);
+			}
+		}
+
+		/* Andre flater: hjørner og kanter */
+		if (crop)
+			continue;
+		for (size_t k = 0; k < pm->surfaces.num; k++) {
+			if ((int)k == skip_surface)
+				continue;
+			struct vec2 q[4];
+			quad_to_pixels(pm, pm->surfaces.array[k].dst, q);
+			for (int c = 0; c < 4; c++)
+				snap_consider(&best, p, q[c]);
+			for (int c = 0; c < 4; c++) {
+				struct vec2 a = q[c], b = q[(c + 1) % 4];
+				float dx = b.x - a.x, dy = b.y - a.y;
+				float len2 = dx * dx + dy * dy;
+				if (len2 <= 0.0f)
+					continue;
+				float t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+				if (t < 0.0f || t > 1.0f)
+					continue;
+				struct vec2 on;
+				vec2_set(&on, a.x + t * dx, a.y + t * dy);
+				/* Kanter teller litt mindre enn hjørner. */
+				float d = vec2_dist(&p, &on) * 1.25f;
+				if (d < best.dist) {
+					best.dist = d;
+					vec2_sub(&best.corr, &on, &p);
+				}
+			}
+		}
+	}
+
+	if (best.dist < limit)
+		return best.corr;
+	struct vec2 corr;
+	vec2_set(&corr, axis_x.dist < limit ? axis_x.corr.x : 0.0f, axis_y.dist < limit ? axis_y.corr.y : 0.0f);
+	return corr;
+}
+
+static struct vec2 snap_single(struct pm_source *pm, struct vec2 n, int skip_surface)
+{
+	if (!pm->snap)
+		return n;
+	struct vec2 p = to_px(pm, n);
+	struct vec2 corr = snap_correction(pm, &p, 1, skip_surface);
+	vec2_add(&p, &p, &corr);
+	return norm_point(pm, p);
+}
+
+/* ---- Dra ------------------------------------------------------------ */
+
+static void drag_warp(struct pm_source *pm, struct vec2 cur, uint32_t mods)
+{
+	struct vec2 *pts = edit_points(pm, (size_t)pm->drag_surface);
+	struct vec2 delta;
+	vec2_sub(&delta, &cur, &pm->drag_start);
+
+	/* Shift + hjørne: skaler proporsjonalt, motsatt hjørne står fast. */
+	if ((mods & INTERACT_SHIFT_KEY) && pm->drag_corner >= 0 && pm->drag_corner < 4) {
+		struct vec2 orig_px[4];
+		quad_to_pixels(pm, pm->drag_orig, orig_px);
+		struct vec2 anchor = orig_px[(pm->drag_corner + 2) % 4];
+		struct vec2 corner = orig_px[pm->drag_corner];
+		struct vec2 mouse = to_px(pm, cur);
+		struct vec2 start = to_px(pm, pm->drag_start);
+		struct vec2 target;
+		/* Hjørnets nye plass = der hjørnet var + hvor langt musa har flyttet seg. */
+		vec2_sub(&target, &mouse, &start);
+		vec2_add(&target, &target, &corner);
+		struct vec2 v, m;
+		vec2_sub(&v, &corner, &anchor);
+		vec2_sub(&m, &target, &anchor);
+		float vv = vec2_dot(&v, &v);
+		float sc = vv > 0.0f ? vec2_dot(&m, &v) / vv : 1.0f;
+		if (sc < 0.02f)
+			sc = 0.02f;
+		for (int c = 0; c < 4; c++) {
+			struct vec2 d;
+			vec2_sub(&d, &orig_px[c], &anchor);
+			vec2_mulf(&d, &d, sc);
+			vec2_add(&d, &d, &anchor);
+			pts[c] = norm_point(pm, d);
+		}
+		return;
+	}
+
+	/* Hvilke punkter flyttes? */
+	int idx[4], n = 0;
+	if (pm->drag_corner >= 4) {
+		idx[n++] = pm->drag_corner - 4;
+		idx[n++] = (pm->drag_corner - 3) % 4;
+	} else if (pm->drag_corner >= 0) {
+		idx[n++] = pm->drag_corner;
+	} else {
+		for (int c = 0; c < 4; c++)
+			idx[n++] = c;
+	}
+
+	struct vec2 moved[4];
+	for (int c = 0; c < 4; c++)
+		vec2_add(&moved[c], &pm->drag_orig[c], &delta);
+
+	if (pm->snap) {
+		struct vec2 px[4];
+		for (int i = 0; i < n; i++)
+			px[i] = to_px(pm, moved[idx[i]]);
+		struct vec2 corr = snap_correction(pm, px, (size_t)n, pm->drag_surface);
+		corr.x /= (float)pm->width;
+		corr.y /= (float)pm->height;
+		for (int c = 0; c < 4; c++)
+			vec2_add(&moved[c], &moved[c], &corr);
+	}
+
+	for (int i = 0; i < n; i++)
+		pts[idx[i]] = moved[idx[i]];
+}
+
 static void pm_mouse_move(void *data, const struct obs_mouse_event *event, bool mouse_leave)
 {
 	UNUSED_PARAMETER(mouse_leave);
@@ -1478,6 +2007,7 @@ static void pm_mouse_move(void *data, const struct obs_mouse_event *event, bool 
 	struct vec2 p;
 	vec2_set(&p, (float)event->x, (float)event->y);
 	struct vec2 cur = norm_point(pm, p);
+	pm->hover = cur;
 
 	if (pm->drag == DRAG_LASSO && pm->lasso.num) {
 		struct vec2 last = pm->lasso.array[pm->lasso.num - 1];
@@ -1487,23 +2017,16 @@ static void pm_mouse_move(void *data, const struct obs_mouse_event *event, bool 
 	} else if (pm->drag == DRAG_MASK_POINT && pm->drag_surface < (int)pm->surfaces.num) {
 		struct pm_surface *s = &pm->surfaces.array[pm->drag_surface];
 		if (pm->drag_corner >= 0 && pm->drag_corner < (int)s->mask.num)
-			s->mask.array[pm->drag_corner] = cur;
-	} else if (pm->drag == DRAG_WARP && pm->drag_surface < (int)pm->surfaces.num) {
-		struct vec2 delta;
-		vec2_sub(&delta, &cur, &pm->drag_last);
-		pm->drag_last = cur;
-
-		struct vec2 *pts = edit_points(pm, pm->drag_surface);
-		if (pm->drag_corner >= 4) {
-			int a = pm->drag_corner - 4, b = (a + 1) % 4;
-			vec2_add(&pts[a], &pts[a], &delta);
-			vec2_add(&pts[b], &pts[b], &delta);
-		} else if (pm->drag_corner >= 0) {
-			vec2_add(&pts[pm->drag_corner], &pts[pm->drag_corner], &delta);
-		} else {
-			for (int c = 0; c < 4; c++)
-				vec2_add(&pts[c], &pts[c], &delta);
+			s->mask.array[pm->drag_corner] = snap_single(pm, cur, -1);
+	} else if (pm->drag == DRAG_HOLE_POINT && pm->drag_surface < (int)pm->surfaces.num) {
+		struct pm_surface *s = &pm->surfaces.array[pm->drag_surface];
+		if (pm->drag_hole >= 0 && pm->drag_hole < (int)s->holes.num) {
+			struct pm_stroke *ho = &s->holes.array[pm->drag_hole];
+			if (pm->drag_corner >= 0 && pm->drag_corner < (int)ho->pts.num)
+				ho->pts.array[pm->drag_corner] = snap_single(pm, cur, -1);
 		}
+	} else if (pm->drag == DRAG_WARP && pm->drag_surface < (int)pm->surfaces.num) {
+		drag_warp(pm, cur, event->modifiers);
 	}
 	pthread_mutex_unlock(&pm->mutex);
 }
@@ -1573,9 +2096,8 @@ static void action_clear_mask(struct pm_source *pm)
 	if (s && surface_has_mask(s)) {
 		push_undo(pm);
 		da_resize(s->mask, 0);
-		for (size_t i = 0; i < s->strokes.num; i++)
-			da_free(s->strokes.array[i].pts);
-		da_resize(s->strokes, 0);
+		strokes_free(&s->strokes);
+		strokes_free(&s->holes);
 		save_to_source(pm);
 	}
 	pthread_mutex_unlock(&pm->mutex);
@@ -1587,8 +2109,91 @@ static void action_set_mode(struct pm_source *pm, int mode)
 	pm->mode = mode;
 	pm->drag = DRAG_NONE;
 	da_resize(pm->lasso, 0);
+	pm->drawing_hole = false;
+	da_resize(pm->hole_draft, 0);
 	obs_data_t *settings = obs_source_get_settings(pm->self);
 	obs_data_set_int(settings, "mode", mode);
+	obs_data_release(settings);
+	pthread_mutex_unlock(&pm->mutex);
+}
+
+/* Snu innholdet i en flate (hjørnene og masken står stille). */
+static void flip_surface(struct pm_surface *s, int kind)
+{
+	struct vec2 o[4];
+	memcpy(o, s->src, sizeof(o));
+	/* 0 = horisontalt, 1 = vertikalt, 2 = 180 grader */
+	static const int map[3][4] = {{1, 0, 3, 2}, {3, 2, 1, 0}, {2, 3, 0, 1}};
+	if (kind < 0 || kind > 2)
+		return;
+	for (int c = 0; c < 4; c++)
+		s->src[c] = o[map[kind][c]];
+}
+
+static void action_flip(struct pm_source *pm, int kind, bool all)
+{
+	pthread_mutex_lock(&pm->mutex);
+	if (pm->surfaces.num) {
+		push_undo(pm);
+		if (all) {
+			for (size_t i = 0; i < pm->surfaces.num; i++)
+				flip_surface(&pm->surfaces.array[i], kind);
+		} else if (selected_surface(pm)) {
+			flip_surface(selected_surface(pm), kind);
+		}
+		save_to_source(pm);
+	}
+	pthread_mutex_unlock(&pm->mutex);
+}
+
+static void proc_flip(void *data, calldata_t *cd)
+{
+	action_flip(data, (int)calldata_int(cd, "kind"), calldata_bool(cd, "all"));
+}
+
+static void proc_select_at(void *data, calldata_t *cd)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->mutex);
+	struct vec2 p;
+	vec2_set(&p, (float)calldata_int(cd, "x"), (float)calldata_int(cd, "y"));
+	int under = surface_under(pm, p);
+	if (under >= 0 && under != pm->selected) {
+		pm->selected = under;
+		save_to_source(pm);
+	}
+	pthread_mutex_unlock(&pm->mutex);
+	calldata_set_bool(cd, "hit", under >= 0);
+}
+
+static void proc_finish_hole(void *data, calldata_t *cd)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->mutex);
+	bool handled = pm->drawing_hole;
+	if (handled)
+		finish_hole(pm, calldata_bool(cd, "cancel"));
+	pthread_mutex_unlock(&pm->mutex);
+	calldata_set_bool(cd, "handled", handled);
+}
+
+static void proc_get_status(void *data, calldata_t *cd)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->mutex);
+	calldata_set_string(cd, "error", pm->input_error && pm->error_name ? pm->error_name : "");
+	calldata_set_bool(cd, "drawing", pm->drawing_hole);
+	calldata_set_bool(cd, "snap", pm->snap);
+	pthread_mutex_unlock(&pm->mutex);
+}
+
+static void proc_set_snap(void *data, calldata_t *cd)
+{
+	struct pm_source *pm = data;
+	pthread_mutex_lock(&pm->mutex);
+	pm->snap = calldata_bool(cd, "enabled");
+	obs_data_t *settings = obs_source_get_settings(pm->self);
+	obs_data_set_bool(settings, "snap", pm->snap);
 	obs_data_release(settings);
 	pthread_mutex_unlock(&pm->mutex);
 }
@@ -1744,6 +2349,9 @@ BUTTON_CB(toggle_shape_clicked, action_toggle_shape(data))
 BUTTON_CB(remove_surface_clicked, action_remove_surface(data))
 BUTTON_CB(reset_surface_clicked, action_reset_surface(data))
 BUTTON_CB(clear_mask_clicked, action_clear_mask(data))
+BUTTON_CB(flip_h_clicked, action_flip(data, 0, false))
+BUTTON_CB(flip_v_clicked, action_flip(data, 1, false))
+BUTTON_CB(rotate_clicked, action_flip(data, 2, false))
 
 static obs_properties_t *pm_get_properties(void *data)
 {
@@ -1753,6 +2361,7 @@ static obs_properties_t *pm_get_properties(void *data)
 	obs_property_t *list = obs_properties_add_list(props, "input", "Innhold (scene eller kilde)",
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(list, "— Velg —", "");
+	obs_property_list_add_string(list, "★ Aktiv scene (programbildet)", PM_PROGRAM);
 	obs_enum_scenes(add_source_to_list, list);
 	obs_enum_sources(add_source_to_list, list);
 
@@ -1764,6 +2373,7 @@ static obs_properties_t *pm_get_properties(void *data)
 	obs_property_list_add_int(mode, "Ferdig (skjul hjelpelinjer)", MODE_SHOW);
 
 	obs_properties_add_bool(props, "guides_on_output", "Vis hjelpelinjer på projektor");
+	obs_properties_add_bool(props, "snap", "Snap (fest til andre flater og bildekanten)");
 
 	obs_properties_add_button(props, "add_surface", "+ Legg til firkantet flate", add_surface_clicked);
 	obs_properties_add_button(props, "add_round", "+ Legg til rund flate", add_round_clicked);
@@ -1771,6 +2381,9 @@ static obs_properties_t *pm_get_properties(void *data)
 	obs_properties_add_button(props, "remove_surface", "Fjern valgt flate", remove_surface_clicked);
 	obs_properties_add_button(props, "reset_surface", "Nullstill valgt flate", reset_surface_clicked);
 	obs_properties_add_button(props, "clear_mask", "Fjern maske på valgt flate", clear_mask_clicked);
+	obs_properties_add_button(props, "flip_h", "Flip innhold horisontalt", flip_h_clicked);
+	obs_properties_add_button(props, "flip_v", "Flip innhold vertikalt", flip_v_clicked);
+	obs_properties_add_button(props, "rotate", "Roter innhold 180°", rotate_clicked);
 
 	obs_properties_add_int(props, "width", "Projektorbredde (px)", 16, 16384, 1);
 	obs_properties_add_int(props, "height", "Projektorhøyde (px)", 16, 16384, 1);
@@ -1798,6 +2411,10 @@ struct obs_source_info projection_mapping_source_info = {
 	.video_tick = pm_video_tick,
 	.video_render = pm_video_render,
 	.enum_active_sources = pm_enum_active_sources,
+	.activate = pm_activate,
+	.deactivate = pm_deactivate,
+	.show = pm_show,
+	.hide = pm_hide,
 	.mouse_click = pm_mouse_click,
 	.mouse_move = pm_mouse_move,
 	.icon_type = OBS_ICON_TYPE_CUSTOM,

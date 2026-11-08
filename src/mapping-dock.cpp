@@ -50,6 +50,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QMenu>
+#include <QContextMenuEvent>
+#include <QScrollBar>
+#include <QToolButton>
 #include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPlatformSurfaceEvent>
@@ -72,6 +76,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <functional>
 #include <string>
 #include <vector>
+#include <set>
+#include <utility>
 
 #define PM_ID "projection_mapping_source"
 
@@ -246,6 +252,106 @@ void undoLast(bool redo)
 	obs_source_release(s);
 }
 
+void flipSelected(obs_source_t *src, int kind, bool all)
+{
+	calldata_t cd = {};
+	calldata_init(&cd);
+	calldata_set_int(&cd, "kind", kind);
+	calldata_set_bool(&cd, "all", all);
+	proc_handler_call(obs_source_get_proc_handler(src), "pm_flip", &cd);
+	calldata_free(&cd);
+}
+
+/* Menyen for å snu innholdet i en flate. Brukes ved høyreklikk og fra panelet. */
+void fillFlipMenu(QMenu *menu, obs_weak_source_t *weak)
+{
+	struct {
+		const char *text;
+		int kind;
+		bool all;
+	} items[] = {
+		{"Flip innhold horisontalt", 0, false},     {"Flip innhold vertikalt", 1, false},
+		{"Roter innhold 180°", 2, false},           {nullptr, 0, false},
+		{"Alle flater: flip horisontalt", 0, true}, {"Alle flater: flip vertikalt", 1, true},
+		{"Alle flater: roter 180°", 2, true},
+	};
+	for (auto &it : items) {
+		if (!it.text) {
+			menu->addSeparator();
+			continue;
+		}
+		int kind = it.kind;
+		bool all = it.all;
+		QAction *a = menu->addAction(QString::fromUtf8(it.text));
+		obs_weak_source_addref(weak);
+		QObject::connect(a, &QAction::triggered, [weak, kind, all]() {
+			obs_source_t *src = obs_weak_source_get_source(weak);
+			if (src)
+				flipSelected(src, kind, all);
+			obs_source_release(src);
+		});
+		QObject::connect(a, &QObject::destroyed, [weak]() { obs_weak_source_release(weak); });
+	}
+}
+
+bool selectAt(obs_source_t *src, int x, int y)
+{
+	calldata_t cd = {};
+	calldata_init(&cd);
+	calldata_set_int(&cd, "x", x);
+	calldata_set_int(&cd, "y", y);
+	proc_handler_call(obs_source_get_proc_handler(src), "pm_select_at", &cd);
+	bool hit = calldata_bool(&cd, "hit");
+	calldata_free(&cd);
+	return hit;
+}
+
+void showFlipMenu(obs_source_t *src, const QPoint &globalPos)
+{
+	obs_weak_source_t *weak = obs_source_get_weak_source(src);
+	QMenu menu;
+	fillFlipMenu(&menu, weak);
+	obs_weak_source_release(weak);
+	menu.exec(globalPos);
+}
+
+bool isDrawingHole(obs_source_t *src)
+{
+	calldata_t cd = {};
+	calldata_init(&cd);
+	proc_handler_call(obs_source_get_proc_handler(src), "pm_get_status", &cd);
+	bool drawing = calldata_bool(&cd, "drawing");
+	calldata_free(&cd);
+	return drawing;
+}
+
+/* Enter lukker, Esc avbryter et hull som tegnes. Sant hvis noe ble gjort. */
+bool finishHoles(bool cancel)
+{
+	auto list = allMappings();
+	bool handled = false;
+	for (auto *s : list) {
+		calldata_t cd = {};
+		calldata_init(&cd);
+		calldata_set_bool(&cd, "cancel", cancel);
+		proc_handler_call(obs_source_get_proc_handler(s), "pm_finish_hole", &cd);
+		handled = handled || calldata_bool(&cd, "handled");
+		calldata_free(&cd);
+	}
+	releaseAll(list);
+	return handled;
+}
+
+bool anyDrawing()
+{
+	auto list = allMappings();
+	bool drawing = false;
+	for (auto *s : list)
+		drawing = drawing || isDrawingHole(s);
+	releaseAll(list);
+	return drawing;
+}
+
 /* ------------------------------------------------------------------ */
 /* Visning i panelet: egen OBS-display + museinteraksjon                */
 
@@ -330,6 +436,20 @@ protected:
 		int x, y;
 		toSource(e->position(), x, y);
 		sendMove(src, x, y, toInteract(e->modifiers()));
+		obs_source_release(src);
+	}
+
+	void contextMenuEvent(QContextMenuEvent *e) override
+	{
+		obs_source_t *src = source();
+		if (!src)
+			return;
+		if (getMode(src) != MODE_SHOW) {
+			int x, y;
+			toSource(QPointF(e->pos()), x, y);
+			if (selectAt(src, x, y))
+				showFlipMenu(src, e->globalPos());
+		}
 		obs_source_release(src);
 	}
 
@@ -465,10 +585,11 @@ const char *modeHint(int mode)
 	switch (mode) {
 	case MODE_MOVE:
 		return "Dra hjørnene for perspektiv, kantene for å flytte en side, midt i flaten for å flytte hele. "
-		       "Tab = neste modus.";
+		       "Shift + hjørne = skaler proporsjonalt. Høyreklikk en flate = flip. Tab = neste modus.";
 	case MODE_MASK:
-		return "Dobbeltklikk på den røde linjen = nytt punkt. Dobbeltklikk på et punkt = fjern det. "
-		       "Hold Alt/⌥ og tegn = legg til. Alt/⌥ + Shift og tegn = visk ut. Cmd/Ctrl+Z angrer.";
+		return "Dobbeltklikk på den røde linjen = nytt punkt, på et punkt = fjern det. "
+		       "Dobbeltklikk midt i flaten = start et hull: klikk punkter, klikk på startpunktet (eller Enter) "
+		       "for å lukke, Esc avbryter. ⌥ + tegn = legg til, ⌥ + Shift + tegn = visk ut. Cmd/Ctrl+Z angrer.";
 	case MODE_CROP:
 		return "Dra rammene for å velge hvilken del av innholdet hver flate viser.";
 	default:
@@ -562,9 +683,23 @@ public:
 		row3->addWidget(redoBtn);
 		root->addLayout(row3);
 
+		auto *row4 = new QHBoxLayout();
+		snapBtn = new QPushButton("Snap", this);
+		snapBtn->setCheckable(true);
+		snapBtn->setToolTip("Fest hjørner og punkter til andre flater og bildekanten når de er nær");
+		snapBtn->setStyleSheet("QPushButton:checked { color: #00d0ff; font-weight: bold; }");
+		auto *flipBtn = new QToolButton(this);
+		flipBtn->setText("Flip ▾");
+		flipBtn->setToolTip("Snu innholdet i valgt flate (eller høyreklikk flaten)");
+		flipBtn->setPopupMode(QToolButton::InstantPopup);
+		flipMenu = new QMenu(flipBtn);
+		flipBtn->setMenu(flipMenu);
 		guidesCheck = new QCheckBox("Vis hjelpelinjer på projektor", this);
 		guidesCheck->setToolTip("Av: linjene vises bare i OBS og i panelet, aldri på projektoren");
-		root->addWidget(guidesCheck);
+		row4->addWidget(snapBtn);
+		row4->addWidget(flipBtn);
+		row4->addWidget(guidesCheck, 1);
+		root->addLayout(row4);
 
 		view = new MappingView(this);
 		root->addWidget(view, 1);
@@ -587,6 +722,17 @@ public:
 		connect(radiusSlider, &QSlider::sliderPressed, this, [this]() { simple("pm_push_undo"); });
 		connect(radiusSlider, &QSlider::valueChanged, this, [this](int v) { setRadius(v); });
 		connect(guidesCheck, &QCheckBox::toggled, this, [this](bool on) { setGuides(on); });
+		connect(snapBtn, &QPushButton::toggled, this, [this](bool on) { setSnap(on); });
+		connect(flipMenu, &QMenu::aboutToShow, this, [this]() {
+			flipMenu->clear();
+			obs_source_t *src = view->source();
+			if (src) {
+				obs_weak_source_t *weak = obs_source_get_weak_source(src);
+				fillFlipMenu(flipMenu, weak);
+				obs_weak_source_release(weak);
+			}
+			obs_source_release(src);
+		});
 		view->onRemoveKey = [this]() {
 			simple("pm_remove_surface");
 		};
@@ -605,6 +751,8 @@ private:
 	QPushButton *undoBtn;
 	QPushButton *redoBtn;
 	QCheckBox *guidesCheck;
+	QPushButton *snapBtn;
+	QMenu *flipMenu;
 	MappingView *view;
 	QLabel *hint;
 	QTimer *timer;
@@ -662,7 +810,36 @@ private:
 		if (auto *b = modeGroup->button(mode))
 			if (!b->isChecked())
 				b->setChecked(true);
-		hint->setText(QString::fromUtf8(modeHint(mode)));
+		calldata_t st = {};
+		calldata_init(&st);
+		proc_handler_call(obs_source_get_proc_handler(src), "pm_get_status", &st);
+		QString error = QString::fromUtf8(calldata_string(&st, "error"));
+		{
+			QSignalBlocker block(snapBtn);
+			snapBtn->setChecked(calldata_bool(&st, "snap"));
+		}
+		calldata_free(&st);
+
+		obs_data_t *cfg = obs_source_get_settings(src);
+		bool program = strcmp(obs_data_get_string(cfg, "input"), "__program__") == 0;
+		obs_data_release(cfg);
+
+		if (!error.isEmpty()) {
+			hint->setStyleSheet("color: #ff6060;");
+			if (program)
+				hint->setText(
+					"⚠ Mapping-kilden er selv med i programbildet, så det kan ikke vises. "
+					"Bytt til en annen scene i OBS, eller legg Projection Mapping i en egen scene "
+					"som du viser med Open Source Projector.");
+			else
+				hint->setText(
+					QString("⚠ Kan ikke vise «%1»: den inneholder selve Projection Mapping-kilden. "
+						"Flytt Projection Mapping til en egen scene.")
+						.arg(error));
+		} else {
+			hint->setStyleSheet("color: #9a9a9a;");
+			hint->setText(QString::fromUtf8(modeHint(mode)));
+		}
 
 		calldata_t cd = {};
 		calldata_init(&cd);
@@ -754,6 +931,19 @@ private:
 		radiusValue->setText(QString("%1 %").arg(v));
 	}
 
+	void setSnap(bool on)
+	{
+		obs_source_t *src = view->source();
+		if (!src)
+			return;
+		calldata_t cd = {};
+		calldata_init(&cd);
+		calldata_set_bool(&cd, "enabled", on);
+		proc_handler_call(obs_source_get_proc_handler(src), "pm_set_snap", &cd);
+		calldata_free(&cd);
+		obs_source_release(src);
+	}
+
 	void setGuides(bool on)
 	{
 		obs_source_t *src = view->source();
@@ -818,6 +1008,7 @@ public:
 		connect(t, &QTimer::timeout, this, [this]() {
 			attach();
 			updateIndicator();
+			updateLocks();
 		});
 		t->start(300);
 		qApp->installEventFilter(this);
@@ -828,6 +1019,25 @@ public:
 		if (qApp)
 			qApp->removeEventFilter(this);
 		clearActive();
+		clearDrawing();
+	}
+
+	/* Lås opp alt vi har låst (ved avslutning / bytte av scenesamling). */
+	void unlockAll()
+	{
+		for (auto &key : lockedByUs) {
+			obs_source_t *src = obs_get_source_by_uuid(key.first.c_str());
+			obs_scene_t *scene = src ? obs_scene_from_source(src) : nullptr;
+			if (!scene && src)
+				scene = obs_group_from_source(src);
+			if (scene) {
+				obs_sceneitem_t *item = obs_scene_find_sceneitem_by_id(scene, key.second);
+				if (item)
+					obs_sceneitem_set_locked(item, false);
+			}
+			obs_source_release(src);
+		}
+		lockedByUs.clear();
 	}
 
 	void addEditorWindow(QWidget *w) { editors.push_back(w); }
@@ -846,6 +1056,10 @@ protected:
 			if (preview && obj == preview)
 				return handleMouse(static_cast<QMouseEvent *>(e));
 			return false;
+		case QEvent::ContextMenu:
+			if (preview && obj == preview)
+				return handleContextMenu(static_cast<QContextMenuEvent *>(e));
+			return false;
 		default:
 			return false;
 		}
@@ -860,6 +1074,84 @@ private:
 
 	obs_weak_source_t *active = nullptr;
 	matrix4 activeInv;
+	obs_weak_source_t *drawing = nullptr; /* kilden som tegner et hull nå */
+	matrix4 drawingInv;
+	std::set<std::pair<std::string, int64_t>> lockedByUs;
+
+	void clearDrawing()
+	{
+		obs_weak_source_release(drawing);
+		drawing = nullptr;
+	}
+
+	/* Mens mappingen redigeres, låses den i OBS så hele bildet ikke flyttes ved et uhell. */
+	static void collectMappingItems(obs_scene_t *scene, int depth, std::vector<obs_sceneitem_t *> &out)
+	{
+		if (!scene || depth > 8)
+			return;
+		struct Ctx {
+			int depth;
+			std::vector<obs_sceneitem_t *> *out;
+		} ctx = {depth, &out};
+		obs_scene_enum_items(
+			scene,
+			[](obs_scene_t *, obs_sceneitem_t *item, void *param) {
+				auto *c = static_cast<Ctx *>(param);
+				if (isMapping(obs_sceneitem_get_source(item))) {
+					obs_sceneitem_addref(item);
+					c->out->push_back(item);
+				} else if (obs_sceneitem_is_group(item)) {
+					collectMappingItems(obs_sceneitem_group_get_scene(item), c->depth + 1, *c->out);
+				}
+				return true;
+			},
+			&ctx);
+	}
+
+	void updateLocks()
+	{
+		if (!anyEditing()) {
+			if (!lockedByUs.empty())
+				unlockAll();
+			return;
+		}
+		obs_frontend_source_list scenes = {};
+		obs_frontend_get_scenes(&scenes);
+		std::vector<obs_sceneitem_t *> items;
+		for (size_t i = 0; i < scenes.sources.num; i++)
+			collectMappingItems(obs_scene_from_source(scenes.sources.array[i]), 0, items);
+		obs_frontend_source_list_free(&scenes);
+
+		for (auto *item : items) {
+			if (!obs_sceneitem_locked(item) && getMode(obs_sceneitem_get_source(item)) != MODE_SHOW) {
+				obs_sceneitem_set_locked(item, true);
+				obs_source_t *parent = obs_scene_get_source(obs_sceneitem_get_scene(item));
+				lockedByUs.insert({obs_source_get_uuid(parent), obs_sceneitem_get_id(item)});
+			}
+			obs_sceneitem_release(item);
+		}
+	}
+
+	/* Zoom i forhåndsvisningen: etiketten viser floor(100 * skala). Finn den eksakte skalaen. */
+	float fixedScale(const obs_video_info &ovi) const
+	{
+		auto *label = main->findChild<QLabel *>("previewScalePercent");
+		if (!label)
+			return 1.0f;
+		QString t = label->text();
+		t.remove('%');
+		bool ok = false;
+		double pct = t.trimmed().toDouble(&ok);
+		if (!ok || pct <= 0.0)
+			return 1.0f;
+		std::vector<double> candidates = {1.0, double(ovi.output_width) / double(ovi.base_width)};
+		for (int level = -32; level <= 32; level++)
+			candidates.push_back(std::pow(8.0, double(level) / 32.0));
+		for (double c : candidates)
+			if (std::floor(float(100.0 * c)) == pct)
+				return float(c);
+		return float((pct + 0.5) / 100.0);
+	}
 
 	void attach()
 	{
@@ -917,8 +1209,6 @@ private:
 			return;
 		}
 		QString tip = "Projection Mapping: Tab bytter modus.";
-		if (!fitMode())
-			tip += " Velg «Tilpass til vindu» (skalering) for å dra direkte i forhåndsvisningen.";
 		indicator->setText(
 			QString("<span style='color:%1; font-size:14px;'>●</span> <b>%2</b>").arg(color, name));
 		indicator->setToolTip(tip);
@@ -930,7 +1220,7 @@ private:
 	/* Widgetposisjon -> lerretskoordinater (samme regnestykke som OBS bruker). */
 	bool toCanvas(const QPointF &pos, float &cx, float &cy) const
 	{
-		if (!preview || !fitMode())
+		if (!preview)
 			return false;
 		obs_video_info ovi;
 		if (!obs_get_video_info(&ovi) || !ovi.base_width || !ovi.base_height)
@@ -942,6 +1232,25 @@ private:
 		int wcx = px.width() - edge * 2, wcy = px.height() - edge * 2;
 		if (wcx <= 0 || wcy <= 0)
 			return false;
+
+		if (!fitMode()) {
+			/* Fast zoom (f.eks. 93 %) med mulig scrolling. */
+			float scale = fixedScale(ovi);
+			int x = int((float(wcx) - float(ovi.base_width) * scale) / 2.0f);
+			int y = int((float(wcy) - float(ovi.base_height) * scale) / 2.0f);
+			float sx = 0.0f, sy = 0.0f;
+			auto *xbar = main->findChild<QScrollBar *>("previewXScrollBar");
+			auto *ybar = main->findChild<QScrollBar *>("previewYScrollBar");
+			if (xbar && xbar->isVisible())
+				sx = float(-xbar->value());
+			if (ybar && ybar->isVisible())
+				sy = float(-ybar->value());
+			float x0 = float(x) + sx + float(edge);
+			float y0 = float(y) + sy + float(edge);
+			cx = (float(pos.x() * dpr) - x0) / scale;
+			cy = (float(pos.y() * dpr) - y0) / scale;
+			return true;
+		}
 
 		double windowAspect = double(wcx) / double(wcy);
 		double baseAspect = double(ovi.base_width) / double(ovi.base_height);
@@ -982,6 +1291,19 @@ private:
 	bool handleMouse(QMouseEvent *e)
 	{
 		uint32_t mods = toInteract(e->modifiers());
+
+		if (e->type() == QEvent::MouseMove && !active && drawing) {
+			/* Strikken fra siste hullpunkt følger musa, uten å stjele bevegelsen fra OBS. */
+			obs_source_t *src = obs_weak_source_get_source(drawing);
+			float cx, cy;
+			if (src && toCanvas(e->position(), cx, cy)) {
+				int x, y;
+				toLocal(drawingInv, cx, cy, x, y);
+				sendMove(src, x, y, mods);
+			}
+			obs_source_release(src);
+			return false;
+		}
 
 		if (e->type() == QEvent::MouseMove || e->type() == QEvent::MouseButtonRelease) {
 			if (!active)
@@ -1045,11 +1367,51 @@ private:
 				sendClick(it->source, x, y, mods, false,
 					  e->type() == QEvent::MouseButtonDblClick ? 2 : 1);
 				consumed = true;
+				clearDrawing();
+				if (isDrawingHole(it->source)) {
+					drawing = obs_source_get_weak_source(it->source);
+					drawingInv = inv;
+				}
 			}
 		}
 		for (auto &it : items)
 			obs_source_release(it.source);
 		return consumed;
+	}
+
+	bool handleContextMenu(QContextMenuEvent *e)
+	{
+		float cx, cy;
+		if (!toCanvas(QPointF(e->pos()), cx, cy))
+			return false;
+		obs_source_t *sceneSrc = obs_frontend_preview_program_mode_active()
+						 ? obs_frontend_get_current_preview_scene()
+						 : obs_frontend_get_current_scene();
+		std::vector<MappingItem> items;
+		matrix4 identity;
+		matrix4_identity(&identity);
+		collectItems(obs_scene_from_source(sceneSrc), identity, 0, items);
+		obs_source_release(sceneSrc);
+
+		obs_source_t *target = nullptr;
+		for (auto it = items.rbegin(); it != items.rend() && !target; ++it) {
+			if (getMode(it->source) == MODE_SHOW)
+				continue;
+			matrix4 inv;
+			if (!matrix4_inv(&inv, &it->toCanvas))
+				continue;
+			int x, y;
+			toLocal(inv, cx, cy, x, y);
+			if (selectAt(it->source, x, y))
+				target = obs_source_get_ref(it->source);
+		}
+		for (auto &it : items)
+			obs_source_release(it.source);
+		if (!target)
+			return false;
+		showFlipMenu(target, e->globalPos());
+		obs_source_release(target);
+		return true;
 	}
 
 	bool isTextInput(QWidget *w) const
@@ -1079,6 +1441,18 @@ private:
 
 	bool handleKey(QKeyEvent *e)
 	{
+		bool isEnter = e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter;
+		bool isEsc = e->key() == Qt::Key_Escape;
+		if ((isEnter || isEsc) && inOurWindows() && !isTextInput(QApplication::focusWidget()) && anyDrawing()) {
+			if (e->type() == QEvent::ShortcutOverride) {
+				e->accept();
+				return true;
+			}
+			finishHoles(isEsc);
+			clearDrawing();
+			return true;
+		}
+
 		bool isTab = e->key() == Qt::Key_Tab && (e->modifiers() & ~Qt::KeypadModifier) == Qt::NoModifier;
 		bool isUndo = e->matches(QKeySequence::Undo);
 		bool isRedo = e->matches(QKeySequence::Redo);
@@ -1129,4 +1503,13 @@ extern "C" void pm_dock_register(void)
 
 	controller = new PreviewController(main);
 	controller->addEditorWindow(dock);
+
+	obs_frontend_add_event_callback(
+		[](enum obs_frontend_event event, void *) {
+			if ((event == OBS_FRONTEND_EVENT_EXIT ||
+			     event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING) &&
+			    controller)
+				controller->unlockAll();
+		},
+		nullptr);
 }
