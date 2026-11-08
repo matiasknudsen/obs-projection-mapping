@@ -719,9 +719,9 @@ public:
 		auto *row6 = new QHBoxLayout();
 		row6->addWidget(new QLabel("Farger", this));
 		colorMode = new QComboBox(this);
-		colorMode->addItem("Nøyaktig som originalen", 0);
-		colorMode->addItem("Lineær (OBS-standard)", 1);
-		colorMode->addItem("Lysere", 2);
+		colorMode->addItem("Standard (som originalen)", 0);
+		colorMode->addItem("Alternativ 1 (lineær)", 1);
+		colorMode->addItem("Alternativ 2 (rå kopi)", 2);
 		colorMode->setToolTip("Hvis fargene ikke ser ut som originalfilen, prøv et annet valg");
 		row6->addWidget(colorMode, 1);
 		root->addLayout(row6);

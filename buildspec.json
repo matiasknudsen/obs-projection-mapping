@@ -38,7 +38,7 @@
     },
     "name": "obs-projection-mapping",
     "displayName": "OBS Projection Mapping",
-    "version": "0.5.1",
+    "version": "0.5.2",
     "author": "Matias Knudsen",
     "website": "https://matiasknudsen.no",
     "email": "matiasknuds@gmail.com"
